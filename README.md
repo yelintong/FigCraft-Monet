@@ -70,7 +70,7 @@ Every property can be keyframed. The timeline sits under the canvas, one track p
 property, and a clip's settings open in a card — from the clip's handles, or by pressing the line
 between two keyframes:
 
-![The timeline, and the card a segment opens](docs/images/motion-timeline.svg)
+![The animation timeline in Monet: one track per animated property (here "Hello · Position"), diamond keyframes, a playhead and playback controls, sitting under the canvas](docs/images/motion-timeline.png)
 
 ## Building
 
