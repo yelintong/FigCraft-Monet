@@ -402,7 +402,9 @@ pub fn stroke_outline_of(path: &BezPath, props: &StrokeProps, closed_shape: bool
     // Centred at `width` (twice the weight for Inside/Outside, which clip half of it away).
     let centred = |width: f64| match (&styled, &props.brush, props.profile()) {
         (Some(st), ..) => st.outline(width, props),
-        (None, Some(b), _) => brush::outline(path, width, props, b).unwrap_or_else(|| stroke_center(path, width, props)),
+        // ABR brush strokes are stamped as pixels by the renderer; this outline only stands in
+        // where a path is still needed (booleans, clipping, paint bounds).
+        (None, Some(_), _) => brush::fallback_outline(path, width, props),
         (None, None, Some(p)) => width::variable_outline(path, width, props, p).unwrap_or_else(|| stroke_center(path, width, props)),
         (None, None, None) => stroke_center(path, width, props),
     };

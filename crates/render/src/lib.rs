@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod backdrop;
+pub mod brush_stroke;
 mod band;
 pub mod blur;
 pub mod boolean;

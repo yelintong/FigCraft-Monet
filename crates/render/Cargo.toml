@@ -15,6 +15,7 @@ figcraft-doc = { workspace = true }
 figcraft-format = { workspace = true }
 figcraft-text = { workspace = true }
 figcraft-pathops = { workspace = true }
+figcraft-abr = { workspace = true }
 tiny-skia = { workspace = true }
 image = { workspace = true }
 moxcms = { workspace = true }

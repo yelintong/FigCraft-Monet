@@ -415,6 +415,19 @@ impl WindowState {
             Opt::new(tr("Taper"), "stroke.widthProfile", json!({ "preset": "taper" })),
             Opt::new(tr("Eye"), "stroke.widthProfile", json!({ "preset": "eye" })),
         ];
+        // Brushes are read from external `.abr` files in the user's brushes directory; the engine
+        // contains no built-in shapes. Group / folder / name keeps packs of hundreds selectable.
+        let installed = figcraft_abr::infos();
+        let brush_label = if installed.is_empty() { "No .abr brushes — import a file".to_string() } else { tr("None").to_string() };
+        let mut brush_options = vec![Opt::new(tr("None"), "stroke.brush", json!({ "preset": Value::Null }))];
+        for b in &installed {
+            let label = if b.folder.is_empty() {
+                format!("{} / {}", b.group, b.name)
+            } else {
+                format!("{} / {} / {}", b.group, b.folder.join(" / "), b.name)
+            };
+            brush_options.push(Opt::new(label, "stroke.brush", json!({ "preset": b.id })));
+        }
         let settings = vec![
             Setting::Caption { tab: 0, text: tr("Stroke style").into() },
             Setting::Options {
@@ -451,14 +464,21 @@ impl WindowState {
             },
             Setting::Options { tab: 0, label: tr("Width profile").into(), active: Some(0), options: profiles.clone() },
             Setting::Caption { tab: 1, text: tr("Brush").into() },
-            Setting::Options {
+            // Every brush comes from an external `.abr` file; "None" keeps a plain vector stroke.
+            Setting::Dropdown {
                 tab: 1,
                 label: tr("Brush").into(),
-                active: Some(0),
+                current: Rc::new(RefCell::new(SharedString::from(brush_label))),
+                anchor: Rc::new(RefCell::new(None)),
+                options: brush_options,
+            },
+            Setting::Options {
+                tab: 1,
+                label: tr("Brush library").into(),
+                active: None,
                 options: vec![
-                    Opt::new(tr("None"), "stroke.brush", json!({ "preset": Value::Null })),
-                    Opt::new(tr("Stretch"), "stroke.brush", json!({ "preset": "stretch" })),
-                    Opt::new(tr("Scatter"), "stroke.brush", json!({ "preset": "scatter" })),
+                    Opt::new(tr("Import brushes…"), "brush.import", json!({})),
+                    Opt::new(tr("Reload"), "brush.reload", json!({})),
                 ],
             },
             Setting::Options { tab: 1, label: tr("Width profile").into(), active: Some(0), options: profiles },

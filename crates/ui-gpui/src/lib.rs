@@ -2502,6 +2502,8 @@ impl CanvasView {
 
             "file.placeImage" => Some((tr("Place image"), crate::open::IMAGE_EXTENSIONS, "file.placeImage")),
 
+            "brush.import" => Some((tr("Import brushes"), BRUSH_EXTENSIONS, "brush.import")),
+
             _ => None,
         };
 
@@ -6729,12 +6731,21 @@ impl drag_manager::WindowDragTarget for CanvasView {
 
 /// 应用入口。
 
+/// Extensions accepted by the native brush-import dialog.
+const BRUSH_EXTENSIONS: &[&str] = &["abr"];
+
 pub fn run() {
     // 文档文字的量算与渲染都走 `figcraft_text`；它的字体库要显式扫一次系统字体，
 
     // 否则文字宽度会是 0/1px（画出来就是一条竖线）。egui 版在启动时也是这么做的。
 
     figcraft_text::scan_system_fonts();
+
+    // 外置 ABR 笔刷库：首次启动把出厂 `.abr` 放进用户目录，之后只扫描目录。
+    // 引擎不内嵌任何笔刷形状，所有笔刷都来自这些外部文件。
+    if let Err(e) = figcraft_abr::bootstrap() {
+        log::warn!("brush library: {e}");
+    }
 
     // `--control <port>`：开本地控制通道（与 `cargo run -p figcraft -- --control 7979` 同义）。
 

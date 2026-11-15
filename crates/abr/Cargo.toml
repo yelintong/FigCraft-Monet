@@ -1,0 +1,12 @@
+[package]
+name = "figcraft-abr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Photoshop ABR brush files: v1/v2/v6+ reader and writer, tip decoding, and the external brush library"
+
+[lints]
+workspace = true
+
+[dependencies]

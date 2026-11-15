@@ -1,5 +1,6 @@
-//! Brushes and pen pressure through the session: `stroke.brush`, rendering and outlining brush
-//! strokes, and the Pencil recording pressure (and its brush) into the stroke it draws.
+//! Brushes and pen pressure through the session: `stroke.brush`, ABR tip compositing and
+//! outlining brush strokes, and the Pencil recording pressure (and its brush) into the stroke it
+//! draws.
 
 use serde_json::{Value, json};
 
@@ -29,39 +30,80 @@ fn alpha(s: &Session, x: f64, y: f64) -> u8 {
     pix.data()[(3 + 1) * 4 + 3]
 }
 
+/// Install a tiny external `.abr` library (round sampled tips) for the renderer to resolve. The
+/// names are the eight legacy ids, so documents saved before ABR support keep painting.
+fn install_test_brushes() {
+    use figcraft_abr::{AbrSample, BrushLibrary, LegacyBrush, LegacyTip, install, write_v12};
+    let disk: Vec<u8> = (0..256)
+        .map(|i| {
+            let (x, y) = ((i % 16) as f64 - 7.5, (i / 16) as f64 - 7.5);
+            if x * x + y * y <= 36.0 { 255 } else { 0 }
+        })
+        .collect();
+    let brush = |name: &str| LegacyBrush {
+        name: name.to_string(),
+        spacing: 20,
+        anti_alias: true,
+        tip: LegacyTip::Sampled(AbrSample { id: String::new(), width: 16, height: 16, depth: 8, data: disk.clone() }),
+    };
+    let names = ["taper", "ink", "ribbon", "bristle", "dots", "stars", "confetti", "leaves"];
+    let brushes: Vec<LegacyBrush> = names.iter().map(|n| brush(n)).collect();
+    let bytes = write_v12(2, &brushes, false).unwrap();
+    let mut lib = BrushLibrary::empty();
+    assert_eq!(lib.add_bytes(&bytes, "monet-defaults").unwrap(), 8);
+    install(lib);
+}
+
 #[test]
-fn brushes_draw_along_the_stroke_and_outline_to_vectors() {
+fn brushes_draw_along_the_stroke_with_external_abr_tips() {
+    install_test_brushes();
     let mut s = Session::new();
     let v = line(&mut s);
     assert_eq!(alpha(&s, 15.0, 0.0), 255, "a plain stroke covers the line");
-    assert!(s.execute("stroke.brush", &json!({"ids": [v], "preset": "glitter"})).is_err());
-    // Dots every 2 weights: centres at 10, 30, 50 … with gaps between.
+    assert!(s.execute("stroke.brush", &json!({"ids": [v], "preset": ""})).is_err(), "an empty brush id is rejected");
+
+    // The document's spacing override: one 10 px tip every 20 units leaves a gap at 10.
     s.execute("stroke.brush", &json!({"ids": [v], "preset": "dots", "spacing": 2})).unwrap();
-    assert_eq!(alpha(&s, 10.0, 0.0), 255);
-    assert_eq!(alpha(&s, 20.0, 0.0), 0, "the gap between two dots");
+    assert_eq!(alpha(&s, 0.0, 0.0), 255, "an ABR tip paints a dab at the stroke's start");
+    assert_eq!(alpha(&s, 10.0, 0.0), 0, "the gap between two dabs stays clear");
     let b = s.execute("node.get", &json!({"id": v})).unwrap()["brush"].clone();
     assert_eq!((b["preset"].as_str(), b["spacing"].as_f64()), (Some("dots"), Some(2.0)), "{b}");
-    // A stretch brush tapers to a point at both ends.
+
+    // A legacy id from a document saved before ABR support resolves to the factory preset.
     s.execute("stroke.brush", &json!({"ids": [v], "preset": "taper"})).unwrap();
-    assert_eq!(alpha(&s, 100.0, 2.0), 255);
-    assert_eq!(alpha(&s, 2.0, 3.0), 0);
-    // Outline stroke turns the brush into a filled vector.
+    assert_eq!(alpha(&s, 0.0, 0.0), 255, "legacy ids still paint");
+
+    // Outlining turns the stroke into a filled vector (the geometric stand-in), still visible.
     s.execute("vector.outlineStroke", &json!({"ids": [v]})).unwrap();
     let doc = s.doc().unwrap();
     let outlined = doc.nodes().find(|n| matches!(n.kind, NodeKind::Vector { .. }) && !n.fills.is_empty()).expect("an outlined vector");
     assert!(outlined.strokes.is_empty() || outlined.stroke.brush.is_none());
-    assert_eq!(alpha(&s, 100.0, 2.0), 255, "looks the same after outlining");
+    assert_eq!(alpha(&s, 100.0, 0.0), 255, "the outlined stroke stays visible");
+
     // Removing the brush: a plain stroke again.
     let mut s = Session::new();
     let v = line(&mut s);
     s.execute("stroke.brush", &json!({"ids": [v], "preset": "dots", "spacing": 2})).unwrap();
     s.execute("stroke.brush", &json!({"ids": [v], "preset": null})).unwrap();
-    assert_eq!(alpha(&s, 20.0, 0.0), 255);
-    // Exports draw it too.
+    assert_eq!(alpha(&s, 10.0, 0.0), 255, "a plain stroke covers the gap");
+    // Exports draw it too (brush strokes are rasterised by the renderer, exported as a path).
     s.execute("stroke.brush", &json!({"ids": [v], "preset": "stars"})).unwrap();
     let doc = s.doc().unwrap();
     assert!(figcraft_svg::export_svg(doc, &[v], &figcraft_svg::SvgOptions::default()).unwrap().contains("<path"));
     assert!(figcraft_pdf::export_nodes_pdf(doc, &[v]).is_ok());
+}
+
+#[test]
+fn brush_commands_list_and_import_the_external_library() {
+    install_test_brushes();
+    let mut s = Session::new();
+    let listed = s.execute("brush.list", &json!({})).unwrap();
+    assert_eq!(listed["brushes"].as_array().map(Vec::len), Some(8), "{listed}");
+    assert!(listed["brushes"][0]["id"].as_str().is_some(), "every brush has a stable ABR id");
+    // Don't run `brush.reload` here: it rescans the real user directory and would replace the
+    // in-memory test library while the rendering test above is using it (tests run in parallel).
+    assert!(crate::cmd::find_command("brush.reload").is_some());
+    assert!(s.execute("brush.import", &json!({})).is_err(), "import needs a path");
 }
 
 #[test]
@@ -81,7 +123,7 @@ fn pressure_becomes_a_width_profile() {
 fn the_pencil_records_pressure_and_its_brush() {
     let mut s = Session::new();
     s.execute("tool.set", &json!({"tool": "pencil"})).unwrap();
-    assert!(s.execute("tool.pencilBrush", &json!({"preset": "nope"})).is_err());
+    assert!(s.execute("tool.pencilBrush", &json!({"preset": ""})).is_err(), "an empty brush id is rejected");
     s.execute("tool.pencilBrush", &json!({"preset": "taper"})).unwrap();
     let ev = |kind, x: f64, p: f32| PointerEvent { pressure: Some(p), ..PointerEvent::at(kind, x, 50.0 + (x / 20.0).sin() * 10.0, 1.0) };
     s.pointer(&ev(PointerKind::Down, 0.0, 0.2)).unwrap();
@@ -137,7 +179,7 @@ fn the_pencil_draws_white_on_a_dark_background() {
     assert_eq!(stroke(&mut s, 320.0, 320.0), (Color::WHITE, Some(Color::WHITE)), "inside a dark frame");
     s.execute("page.setBackground", &json!({"color": "#1E1E1E"})).unwrap();
     s.execute("node.create", &json!({"type": "frame", "x": 600, "y": 300, "width": 200, "height": 200, "props": {"fills": ["#FFFFFF"]}})).unwrap();
-    assert_eq!(stroke(&mut s, 620.0, 320.0), (Color::BLACK, Some(Color::BLACK)), "inside a light frame on a dark page");
+    assert_eq!(stroke(&mut s, 620.0, 320.0), (Color::BLACK, Some(Color::BLACK)), "a light frame on a dark page");
     // A frame without a fill, or with a see-through one, is looked through to what is behind it.
     s.execute("node.create", &json!({"type": "frame", "x": 900, "y": 300, "width": 200, "height": 200, "props": {"fills": []}})).unwrap();
     assert_eq!(stroke(&mut s, 920.0, 320.0), (Color::WHITE, Some(Color::WHITE)), "a frame without a fill on a dark page");

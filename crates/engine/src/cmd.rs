@@ -2,6 +2,7 @@
 
 pub mod animation;
 pub mod arrange;
+pub mod brushes;
 pub mod comment;
 pub mod component;
 pub mod create;
@@ -100,6 +101,7 @@ fn registry() -> &'static Registry {
         list.extend(library::specs());
         list.extend(proto::specs());
         list.extend(proto_actions::specs());
+        list.extend(brushes::specs());
         list.extend(animation::specs());
         list.extend(comment::specs());
         list.extend(crate::vectoredit::specs());

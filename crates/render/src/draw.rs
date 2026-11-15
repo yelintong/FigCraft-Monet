@@ -975,9 +975,13 @@ fn draw_content(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize,
                     _ => figcraft_doc::geometry::stroke_geometry(n),
                 };
                 if let Some(g) = geom {
-                    let area = stroke_area(n, &g, closed);
-                    if let Some(tp) = ts_path(&area) {
-                        fill_with(pix, &tp, &n.strokes, w, h, xf, stroke_rule(n, closed), ctx, None);
+                    // ABR strokes are stamped as raster dabs, not filled as a vector outline.
+                    let stamped = n.stroke.brush.is_some() && crate::brush_stroke::paint(ctx, pix, n, &g, xf, w, h);
+                    if !stamped {
+                        let area = stroke_area(n, &g, closed);
+                        if let Some(tp) = ts_path(&area) {
+                            fill_with(pix, &tp, &n.strokes, w, h, xf, stroke_rule(n, closed), ctx, None);
+                        }
                     }
                 }
             }

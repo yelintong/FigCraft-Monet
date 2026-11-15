@@ -103,9 +103,9 @@ pub struct StrokeProps {
     pub brush: Option<Brush>,
 }
 
-/// A brush stroke: the stroke drawn with a built-in brush shape (`preset`, an id of
-/// `figcraft_pathops::brush::PRESETS`), stretched along the path or scattered along it every
-/// `spacing` stroke weights with repeatable jitter from `seed`. A width profile scales it.
+/// A brush stroke: `preset` is the id of a brush in an external `.abr` file. The renderer stamps
+/// that brush's grayscale tip along the path, spaced by the preset's spacing (the `spacing` field
+/// is a document-level override) with repeatable jitter from `seed`. A width profile scales it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Brush {

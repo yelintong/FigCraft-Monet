@@ -18,7 +18,7 @@ pub const STROKE_SIDES: [&str; 4] = ["strokeTopWeight", "strokeRightWeight", "st
 /// Keys `node.set` understands (documented for agents).
 pub const KEYS: &str = "name, visible, locked, opacity (0-1 or \"50%\"), blend, x, y (relative to the parent frame; groups don't count), width, height, rotation (degrees), \
 fills (paints or colours; gradients as {type: linearGradient|radialGradient|angularGradient|diamondGradient, stops: [\"#hex\", ...], from?, to?} too), fill (colour, {$var: variable id or name}, or \"none\"/null: no fill), strokes, stroke (colour, {$var: variable id or name}, or \"none\"/null: no stroke), strokeWeight, strokeAlign (inside|center|outside), strokeSides [t,r,b,l], strokeTopWeight / strokeRightWeight / strokeBottomWeight / strokeLeftWeight (one side; turns on individual strokes), \
-strokeCap / startCap / endCap, strokeJoin, miterAngle (degrees: sharper joins bevel; or miterLimit as a ratio), dashes [..], dashCap (none|round|square; null: dashes take startCap and endCap), widthProfile (preset uniform|wedge|taper|eye|rounded|pinch, [[t, scale], ...] or null), brush (preset id, {preset, spacing, sizeJitter, rotationJitter, scatter, seed} or null), cornerRadius (n or [tl,tr,br,bl]), cornerSmoothing (0-1), effects, \
+strokeCap / startCap / endCap, strokeJoin, miterAngle (degrees: sharper joins bevel; or miterLimit as a ratio), dashes [..], dashCap (none|round|square; null: dashes take startCap and endCap), widthProfile (preset uniform|wedge|taper|eye|rounded|pinch, [[t, scale], ...] or null), brush (an external .abr brush id, {preset, spacing, sizeJitter, rotationJitter, scatter, seed} or null), cornerRadius (n or [tl,tr,br,bl]), cornerSmoothing (0-1), effects, \
 clip, isMask, layout (null|horizontal|vertical|grid|{...}), gap, crossGap, padding (n or [t,r,b,l]), paddingTop/Right/Bottom/Left, \
 mainAlign (min|center|max, or the auto gaps spaceBetween|spaceAround|spaceEvenly), crossAlign (min|center|max|baseline: first text baselines, horizontal layouts), contentAlign (wrapped lines: auto = packed where crossAlign says | spaceBetween), wrap (rows of a horizontal layout, columns of a vertical one), strokesIncluded (the frame's inside stroke takes up space), reverseZ (canvas stacking: true = first on top), \
 columnGap / rowGap (aliases of gap / crossGap), gridColumns, gridRows, columnTracks / rowTracks ([120 | \"1fr\" | \"auto\" | {sizing, value}]), \
@@ -231,7 +231,7 @@ pub(crate) const WIDTH_PROFILE_HELP: &str = "widthProfile: a preset (uniform|wed
 /// The stroke caps `strokeCap`, `startCap` and `endCap` take (every [`StrokeCap`]).
 pub(crate) const STROKE_CAP_HELP: &str = "none|round|square|lineArrow|triangleArrow|reversedTriangle|circleFilled|diamondFilled";
 
-pub(crate) const BRUSH_HELP: &str = "brush: a preset (taper|ink|ribbon|bristle: stretched; dots|stars|confetti|leaves: scattered), {preset, spacing? (× weight), sizeJitter? (0-1), rotationJitter? (0-1), scatter? (0-4 × weight), seed?}, or null (a plain stroke)";
+pub(crate) const BRUSH_HELP: &str = "brush: an external .abr brush id (`brush.list` lists them, `brush.import` adds a file), {preset (id), spacing? (× weight), sizeJitter? (0-1), rotationJitter? (0-1), scatter? (0-4 × weight), seed?}, or null (a plain stroke)";
 
 /// A brush from a preset id, `{preset, spacing?, sizeJitter?, rotationJitter?, scatter?, seed?}`
 /// or null. `Some(None)` = no brush; `None` = not a brush (or an unknown preset).
@@ -242,7 +242,12 @@ pub fn brush_of(v: &Value) -> Option<Option<Brush>> {
         Value::Object(_) => serde_json::from_value::<Brush>(snake(v)).ok()?,
         _ => return None,
     };
-    figcraft_pathops::brush::preset(&b.preset).map(|_| Some(b.sanitized()))
+    // A brush names a preset in the external `.abr` library. Headless sessions may have no
+    // library attached, so the id is checked by shape here and resolved when the stroke renders.
+    if b.preset.trim().is_empty() {
+        return None;
+    }
+    Some(Some(b.sanitized()))
 }
 
 /// A width profile from a preset name, points (`[[t, scale] | [t, left, right], ...]` or
