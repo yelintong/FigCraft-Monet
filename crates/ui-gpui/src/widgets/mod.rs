@@ -63,8 +63,8 @@ pub use input::text_edit::NumberConfig;
 pub use input::{EditBuffer, EditOutcome, Slot, TextInput, char_to_utf16_str, utf16_to_char_str};
 pub use input::{TextEdit, TextField};
 pub use panel_section::{
-    FieldRow, PanelSection, field_row, field_row_full, field_row_full_trailing, field_row_h, panel_section, segmented, sublabel_row, sublabel_row2,
-    sublabels,
+    FieldRow, PanelSection, block_row, field_row, field_row_full, field_row_full_trailing, field_row_h, panel_section, segmented, sublabel_row,
+    sublabel_row2, sublabels,
 };
 // `HEADER_H` is already this module's 40 pt header constant; the popover shares that value.
 pub use popover::{

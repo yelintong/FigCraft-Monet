@@ -10,26 +10,32 @@
 //! very same `CmdQueue` the right panel uses, so the engine sees the exact same commands.
 
 use crate::canvas::geom::Color32;
-use crate::panels::right::data::PanelData;
+use crate::panels::right::data::{EffectRow, GridRow, PanelData, TextData};
+use crate::picker_icons::{self, PickerIcon};
 use crate::panels::right::variables::{self, VariablesData, VariablesEditor};
 use crate::panels::{Cmd, Cmds};
 use crate::widgets::menu::menu_popup_in;
 use crate::widgets::popover::{self, HEADER_H, Open, Surface, WIDTH, popover_window, title_text};
 use crate::widgets::typ_icons::TypIcon;
-use crate::widgets::{Icon, IconButton, SegItem, Segmented, Slot, TextField, number_field, pt, rgba, search_field, tokens};
+use crate::widgets::{Icon, IconButton, SegItem, Segmented, Slot, TextEdit, TextField, number_field, pt, rgba, search_field, tokens};
 use crate::widgets::{MenuRow, dropdown};
 use figcraft_i18n::tr;
 use gpui::{
-    AnyElement, App, Bounds, Entity, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, SharedString, Size, Window, div, point,
-    prelude::*, px, size,
+    AnyElement, App, Bounds, Corners, Entity, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, SharedString, Size,
+    Window, div, point, prelude::*, px, size,
 };
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Half of a 24 pt icon button. Callers hand us the press point; the placement rule wants the
 /// button's top (`ui-egui/src/popover.rs`: "its top on `y` (the button's top)").
 const BUTTON_HALF: f32 = 12.0;
+
+/// 样式编辑器属性行里那颗左侧 `Dropdown` 的宽度：卡片 304 − 左缩进 `PAD` 16 − 右缩进
+/// `PAD_RIGHT` 8 − 尾部两颗 24 pt 图标按钮 48。与右栏 `field_row_full_trailing` 的字段列同宽，
+/// 这样两个面板里同一行的内缩与图标位置完全一致。
+const STYLE_ROW_FIELD_W: f32 = 232.0;
 
 /// Which of the five old popovers is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +53,9 @@ pub(crate) enum WindowKind {
     TypeSettings,
     /// 效果设置小窗：点右栏效果行的方框弹出，装该效果的设置项与类型切换。
     EffectSettings,
+    /// 本地样式编辑器（egui `style_picker::editor`）：与上面几个设置窗共用
+    /// `WindowState` 通用弹窗卡 + `Setting` 通用行，只是分派标识不同，不是另一套弹窗实现。
+    StyleEditor,
 }
 
 /// One clickable row of a list window (a variable, a style, a create action).
@@ -152,6 +161,131 @@ pub(crate) enum Setting {
         label: SharedString,
         field: Entity<TextField>,
     },
+    /// 颜色属性行（Figma `styles_properties_form`）：16×16 色板 + 名称。空 label 时就是
+    /// 那个独立预览块。
+    Swatch {
+        tab: u8,
+        label: SharedString,
+        paint: figcraft_color::Paint,
+        /// `Some(i)` = 可点开的属性行（`i` 是 paints 下标，点击打开取色器）；
+        /// `None` = 顶部那个纯预览块，不可点。
+        index: Option<usize>,
+    },
+    /// 颜色样式的 paint 行（lizard `color_style_editor`）：行 304×32，
+    /// `ColorControl` 220×24 @ `x+16`（色块 + hex），眼睛 24×24 @ `x+244`，
+    /// 减号 24×24 @ `x+272`。
+    PaintRow {
+        tab: u8,
+        style_id: String,
+        index: usize,
+        paint: figcraft_color::Paint,
+        /// `ColorField` 的两个内嵌编辑框（hex / 透明度数值）：实体必须在有 `&mut App` 的
+        /// 构造期建立，渲染期只负责摆位置。
+        hex_ed: Entity<TextEdit>,
+        op_ed: Entity<TextEdit>,
+    },
+    /// 颜色样式的预览区（lizard `color_style_editor`：`304×120` 区，内缩 16 后
+    /// `272×104` 的色块，`style_paint_preview`）。
+    PaintPreview {
+        paint: figcraft_color::Paint,
+    },
+    /// 文本样式的预览框（lizard `text_style_editor`：304×120 灰底，渲染 "Rag 123" 采样字）。
+    TextPreview {
+        text: serde_json::Value,
+    },
+    /// 效果样式的渲染预览（lizard `effect_style_preview`：304×152 棋盘底 + 渲染后的椭圆样本）。
+    EffectPreview {
+        effects: serde_json::Value,
+    },
+    /// 网格样式的示意图（lizard `grid_style_preview`：棋盘底 + 居中网格/行列样本）。
+    GridPreview {
+        grids: serde_json::Value,
+    },
+    /// 精确留白（lizard 的 `ui.add_space(x)`）。StyleEditor 的正文容器 gap=0，间距全靠它控制，
+    /// 不能再用通用 `popover_body()` 的 8pt gap（会和各行自带 margin 叠加成 16）。
+    Spacer {
+        tab: u8,
+        h: f32,
+    },
+    /// Properties 分节标题行（lizard 4 个编辑器共用）：304×32，标题在 `x+16`、
+    /// `semibold(11.0)` / `t.text`，行尾 24×24 的「+」按钮在 `x+284`（`right()-20`）。
+    /// text 编辑器是 304×24 且没有「+」。`menu` 为空 = 不画按钮；「Add fill」等文字只是
+    /// 按钮的 tooltip，**不是可见标签**。点击把候选项追加进 `array` 后整体写回 `style.update`。
+    SectionTitle {
+        tab: u8,
+        text: SharedString,
+        h: f32,
+        style_id: String,
+        array: serde_json::Value,
+        menu: Vec<(SharedString, serde_json::Value)>,
+        /// 菜单锚点（点「+」时回填按钮矩形）。
+        anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    },
+    /// 文本样式 Properties 下的三行紧凑控件（lizard `text_style_editor` 的 `ui.scope`，
+    /// `item_spacing = (8,8)`，每行先 `add_space(16)`）：
+    ///   行1：字体族下拉 248×24
+    ///   行2：字重下拉 120 + 字号 120
+    ///   行3：行高 120 + 字距 120 + Dots
+    /// 全部无左侧标签（字体族/字重靠下拉当前值，行高/字距靠字段自带的 glyph）。
+    TextControls {
+        tab: u8,
+        family: Rc<RefCell<SharedString>>,
+        families: Vec<SharedString>,
+        font_style: Rc<RefCell<SharedString>>,
+        font_styles: Vec<SharedString>,
+        size_field: Entity<TextField>,
+        line_field: Entity<TextField>,
+        spacing_field: Entity<TextField>,
+        style_id: String,
+        text: Rc<RefCell<serde_json::Value>>,
+        family_anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+        style_anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    },
+    /// 效果样式的属性行（lizard `effect_style_editor`）：行 304×32，类型下拉 + 眼睛 + 减号。
+    ///
+    /// 行本身走右栏的**统一网格**（`field_row_full_trailing`）：左缩进 `PAD` 16、右缩进
+    /// `PAD_RIGHT` 8、尾部两颗 24 pt `IconButton` 各占一个 `SLOT`；标签是 `Dropdown::fill()`
+    /// 那一颗（与右栏效果行、填充行同源），不再手写 flex 行 + 裸文字。
+    EffectRow {
+        tab: u8,
+        style_id: String,
+        index: usize,
+        label: SharedString,
+        ty: &'static str,
+        visible: bool,
+        effect: serde_json::Value,
+        /// 完整 effects 数组（编辑时整体写回 `style.update {value}`）。
+        array: serde_json::Value,
+        /// 类型下拉的菜单锚点（点按钮时回填按钮矩形）。
+        anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    },
+    /// 网格样式的属性行（lizard `grid_style_editor`）：行 304×32，类型下拉 + 眼睛 + 减号。
+    /// 与 `EffectRow` 同构（同一套统一网格 + `Dropdown` + `IconButton`）。
+    GridRow {
+        tab: u8,
+        style_id: String,
+        index: usize,
+        label: SharedString,
+        visible: bool,
+        grids: serde_json::Value,
+        anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    },
+    /// 多行输入（lizard `TextEdit::multiline(...).desired_rows(2)`）：caption 紧贴、
+    /// 输入框高度 `rows × 24`。
+    Multiline {
+        tab: u8,
+        label: SharedString,
+        field: Entity<TextField>,
+        rows: f32,
+    },
+    /// 垂直表单行（Figma `styles_properties_form`）：10 pt 标签在上、整宽输入框在下。
+    /// `Number` 是横排（76 pt 标签 + 控件），样式编辑器的 Name / Description 要的是这种。
+    /// 只加布局能力，不指定任何颜色——墨色与字段底色仍由通用 `TextField` 自己决定。
+    Field {
+        tab: u8,
+        label: SharedString,
+        field: Entity<TextField>,
+    },
     /// Type settings 顶部的「预览」大框（lizard `type_settings_basics` 的 `previewBox`）。
     /// 所有页签共用、只画一次；内容是选中文本的字面，灰底、11 pt、次要色。
     Preview {
@@ -199,9 +333,220 @@ pub(crate) enum Setting {
     },
 }
 
+/// Colour models the value row can show, in the same order as `ui-egui::colorpicker::MODELS`.
+const COLOR_MODELS: [&str; 7] = ["Hex", "RGB", "HSL", "HSB", "LCH", "OKLCH", "CSS"];
+
+thread_local! {
+    /// Colours picked in any colour picker this session, newest first (ui-egui
+    /// `session.recent_colors`), so closing and reopening the picker keeps them.
+    static RECENT_COLORS: RefCell<Vec<Color32>> = const { RefCell::new(Vec::new()) };
+    /// The page's most used solid colours, cached per (document, page).
+    static PAGE_COLORS: RefCell<(Option<(usize, figcraft_doc::NodeId)>, Vec<Color32>)> =
+        const { RefCell::new((None, Vec::new())) };
+}
+
+fn remember_recent(c: Color32) {
+    RECENT_COLORS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|x| x.0 != c.0);
+        r.insert(0, c);
+        r.truncate(14);
+    });
+}
+
+fn recent_colors() -> Vec<Color32> {
+    RECENT_COLORS.with(|r| r.borrow().clone())
+}
+
+/// Recompute the page palette when the document or page changed. Called once per render; the
+/// expensive walk only runs on a document/page change.
+pub(crate) fn cache_page_colors(doc: &figcraft_doc::Document, page: figcraft_doc::NodeId) {
+    let key = (doc as *const figcraft_doc::Document as usize, page);
+    PAGE_COLORS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 == Some(key) {
+            return;
+        }
+        c.1 = figcraft_engine::cmd::styles::document_colors(doc, page)
+            .into_iter()
+            .take(21)
+            .map(|(col, _)| picker_c32(col))
+            .collect();
+        c.0 = Some(key);
+    });
+}
+
+fn page_colors() -> Vec<Color32> {
+    PAGE_COLORS.with(|c| c.borrow().1.clone())
+}
+
+/// A 6-column grid of colour swatches, the shape both the page and the recent rows use.
+fn swatch_grid(colors: Vec<Color32>, pick: Rc<dyn Fn(Color32, &mut Window, &mut App)>) -> gpui::Div {
+    let mut grid = div().w(pt(240.0)).grid().grid_cols(6).gap(pt(6.0));
+    for col in colors {
+        let p = pick.clone();
+        grid = grid.child(
+            crate::widgets::swatch(figcraft_color::Paint::solid(picker_color(col)), 20.0)
+                .on_click(move |window, cx| p(col, window, cx)),
+        );
+    }
+    grid
+}
+
+fn picker_color(c: Color32) -> figcraft_color::Color {
+    figcraft_color::Color::from_rgba8(c.0[0], c.0[1], c.0[2], c.0[3])
+}
+
+pub(crate) fn picker_c32(c: figcraft_color::Color) -> Color32 {
+    let [r, g, b, a] = c.to_rgba8();
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// The three field values in CSS display units (ui-egui `Polar::values`), or `None` for the
+/// text models Hex / CSS.
+fn model_values(model: usize, c: Color32) -> Option<[f64; 3]> {
+    let col = picker_color(c);
+    Some(match COLOR_MODELS.get(model).copied()? {
+        "RGB" => {
+            let [r, g, b, _] = c.0;
+            [f64::from(r), f64::from(g), f64::from(b)]
+        }
+        "HSL" => {
+            let x = figcraft_color::Hsl::from_color(col);
+            [f64::from(x.h), f64::from(x.s * 100.0), f64::from(x.l * 100.0)]
+        }
+        "HSB" => {
+            let x = figcraft_color::Hsb::from_color(col);
+            [f64::from(x.h), f64::from(x.s * 100.0), f64::from(x.b * 100.0)]
+        }
+        "LCH" => {
+            let x = figcraft_color::Lch::from_color(col);
+            [f64::from(x.l), f64::from(x.c), f64::from(x.h)]
+        }
+        "OKLCH" => {
+            let x = figcraft_color::Oklch::from_color(col);
+            [f64::from(x.l * 100.0), f64::from(x.c), f64::from(x.h)]
+        }
+        _ => return None,
+    })
+}
+
+/// Clamp / wrap one edited field to the model's range (ui-egui `PolarField`).
+fn clamp_model_value(model: usize, k: usize, x: f64) -> f64 {
+    let wrap = |v: f64| v.rem_euclid(360.0);
+    match (COLOR_MODELS.get(model).copied(), k) {
+        (Some("RGB"), _) => x.clamp(0.0, 255.0),
+        (Some("HSL" | "HSB"), 0) => wrap(x),
+        (Some("HSL" | "HSB"), _) => x.clamp(0.0, 100.0),
+        (Some("LCH"), 0) => x.clamp(0.0, 100.0),
+        (Some("LCH"), 1) => x.clamp(0.0, 230.0),
+        (Some("LCH"), _) => wrap(x),
+        (Some("OKLCH"), 0) => x.clamp(0.0, 100.0),
+        (Some("OKLCH"), 1) => x.clamp(0.0, 0.5),
+        (Some("OKLCH"), _) => wrap(x),
+        _ => x,
+    }
+}
+
+fn model_decimals(model: usize, k: usize) -> usize {
+    if COLOR_MODELS.get(model) == Some(&"OKLCH") && k == 1 { 2 } else { 0 }
+}
+
+/// Turn edited field values back into a colour, keeping the current alpha.
+fn model_color(model: usize, v: [f64; 3], c: Color32) -> Color32 {
+    let a = picker_color(c).a;
+    let [x, y, z] = v.map(|v| v as f32);
+    let col = match COLOR_MODELS.get(model).copied().unwrap_or("Hex") {
+        "RGB" => figcraft_color::Color::new(x / 255.0, y / 255.0, z / 255.0, a),
+        "HSL" => figcraft_color::Hsl { h: x, s: y / 100.0, l: z / 100.0 }.to_color(),
+        "HSB" => figcraft_color::Hsb { h: x, s: y / 100.0, b: z / 100.0 }.to_color(),
+        "LCH" => figcraft_color::Lch { l: x, c: y, h: z }.to_color(),
+        "OKLCH" => figcraft_color::Oklch { l: x / 100.0, c: y, h: z }.to_color(),
+        _ => return c,
+    };
+    picker_c32(col.with_alpha(a))
+}
+
+/// The paint a Fill/Stroke row's picker edits. Lets the picker switch the paint kind and its
+/// blend mode in place (ui-egui `show`'s type segments and blend dropdown).
+#[derive(Clone)]
+pub(crate) struct PaintPicker {
+    pub paint: figcraft_color::Paint,
+    /// Write the whole paint back through the row's own command (`selection.setPaint`).
+    pub on_write: Rc<dyn Fn(figcraft_color::Paint, &mut Window, &mut App)>,
+}
+
+/// 样式编辑器的一行属性（egui `property_row`）：paint 带 14×14 色板，其余带类型图标。
+#[derive(Clone)]
+pub(crate) enum StyleProp {
+    /// `index` 是它在样式 paints 数组里的原始下标（egui `EditPaint(id, i)` 用同一个 i）。
+    Paint { label: String, paint: figcraft_color::Paint, index: usize },
+    Icon { label: String },
+}
+
+/// 样式编辑器正文（egui `style_picker::editor`）：Name / Description 两个输入框 + 属性行 +
+/// 是否有选区（决定要不要画 "Update from selection"）。全部照源码字段来。
+pub(crate) struct StyleEditState {
+    pub id: String,
+    pub has_selection: bool,
+    /// 完整 paints 数组：属性行点开取色器后要整体写回 `style.update {value}`。
+    pub paints: Vec<figcraft_color::Paint>,
+    /// 文本样式的完整 `TextStyle` JSON：编辑某一字段时整体写回 `style.update {value}`。
+    pub text: Option<serde_json::Value>,
+    /// 效果样式的完整 effects 数组（每行带原始 JSON，供写回 `style.update {value}`）。
+    pub effects: Option<Vec<EffectRow>>,
+    /// 网格样式的完整 grids 数组（每行带原始 JSON，供写回 `style.update {value}`）。
+    pub grids: Option<Vec<GridRow>>,
+    /// 打开取色器用（`PopupReqs` 只有面板侧才有）。
+    pub popups: crate::panels::PopupReqs,
+    /// 属性行点开的**子浮层**（取色器 / 排版设置）：挂在样式面板自己身上、画在它左侧，
+    /// 不走 root 的 `popup` 单槽 —— 那条路会用一个新弹窗替换掉样式面板本身
+    /// （用户 2026-11-15：「怎么能打开一个关一个呢」）。
+    pub picker: Rc<RefCell<Option<Box<WindowState>>>>,
+}
+
+/// 样式编辑弹窗刷新用的文档快照：命令回写文档后，据此重建正文 `settings`。
+struct StyleSnap {
+    ty: &'static str,
+    name: String,
+    description: String,
+    paints: Vec<figcraft_color::Paint>,
+    text: Option<serde_json::Value>,
+    effects: Option<Vec<EffectRow>>,
+    grids: Option<Vec<GridRow>>,
+}
+
+
 struct ColorState {
-    current: Color32,
+    /// Shared: picking anywhere in the picker must refresh the SV square, hue and alpha strips.
+    current: Rc<Cell<Color32>>,
+    /// `Some` when opened from a Fill/Stroke row: shows the paint-kind and blend controls.
+    paint: Option<PaintPicker>,
+    /// The live paint behind `paint`, kept in step with `on_write`, so the kind / stop editors
+    /// always read the value that was just written instead of the one the picker opened with.
+    paint_state: Option<Rc<RefCell<figcraft_color::Paint>>>,
+    /// Selected gradient stop (ui-egui's `stop_id`).
+    grad_sel: Rc<Cell<usize>>,
+    /// Figma 只保留一个「渐变」类型格，用它记住下次切回渐变时用哪种（`paintPickerFilter`）。
+    grad_kind: Rc<Cell<usize>>,
+    /// 色板集：0 = 在此页面，1 = 最近使用。
+    swatch_set: Rc<Cell<u8>>,
+    /// 色板集下拉的触发矩形（菜单开着时 `Some`）。
+    swatch_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The blend-mode dropdown's trigger rectangle while its menu is open.
+    blend_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Which of [`COLOR_MODELS`] the value row shows.
+    model: Rc<Cell<usize>>,
+    /// Last (model, rgba) the fields were written for, so typing isn't overwritten every frame.
+    shown: Rc<Cell<(usize, [u8; 4])>>,
+    /// The model dropdown's trigger rectangle while its menu is open (`None`: closed).
+    model_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Hex / CSS text field.
     hex: Entity<TextField>,
+    /// The three numeric fields of RGB / HSL / HSB / LCH / OKLCH.
+    fields: [Entity<TextField>; 3],
+    /// Alpha percentage (all models except CSS).
+    alpha: Entity<TextField>,
     on_pick: Rc<dyn Fn(Color32, &mut Window, &mut App)>,
 }
 
@@ -215,6 +560,11 @@ pub(crate) struct WindowState {
     pad: f32,
     surface: Surface,
     height: f32,
+    /// 上一帧量到的**真实**卡片高度（`Popover::on_measure` 写入，`0` = 还没量过）。
+    ///
+    /// `height` 是构造期估算，只够用来算锚点抬升；一旦估算偏大，`clamp` 会把卡片顶死在
+    /// 上边界、怎么拖都不动（用户 2026-11-15：取色器「跟他绑死在一起了」）。
+    measured_h: Rc<Cell<f32>>,
     /// `Some` once the header has been dragged (egui's `Place::At`).
     place: Option<Point<Pixels>>,
     origin: Point<Pixels>,
@@ -236,6 +586,8 @@ pub(crate) struct WindowState {
     search: Option<Entity<TextField>>,
     query: Rc<RefCell<String>>,
     color: Option<ColorState>,
+    /// 本地样式编辑器（egui `style_picker::editor`）的正文状态：两个输入框 + 属性行。
+    style_edit: Option<StyleEditState>,
     /// 完整变量编辑器（只有 `VariablesTable` 用）：持有只读快照 + retained 交互状态。
     /// 延迟到 `body_element` 才创建 —— 那里才拿得到 `&mut App` 来建搜索框 / 值输入框。
     editor: Option<VariablesEditor>,
@@ -249,6 +601,87 @@ pub(crate) struct WindowState {
     overlays: Rc<RefCell<Vec<AnyElement>>>,
     /// 当前浮层的关闭回调（`render()` 每帧写入），供菜单 `dismiss` 之外复用。
     dismiss: Rc<RefCell<Option<Rc<dyn Fn(&mut Window, &mut App)>>>>,
+}
+
+/// 文本样式的 `text` 对象 → `Type settings` 用的 `TextData` 快照。
+///
+/// 文本样式的编辑器与「选中文本节点」的 Type settings 是**同一个面板**（Figma 里也是同一张
+/// 面板，只是写入目标不同）。面板正文只读 `TextData`，所以这里把样式里的那几个键读成快照；
+/// 样式没写的键留空（面板就显示「未选」），与 Mixed 的显示一致。
+fn style_text_data(v: &Value) -> TextData {
+    /// 只接受面板认识的那几个枚举值，其余当空。
+    fn one(v: &Value, k: &str, allowed: &[&'static str]) -> Option<&'static str> {
+        let s = v.get(k).and_then(Value::as_str)?;
+        allowed.iter().copied().find(|a| *a == s)
+    }
+    /// 行高 / 字距：数字 = px，`"150%"` = 百分比，`"AUTO"` = 空。
+    fn num_or_pct(v: &Value, k: &str) -> Option<(f64, bool)> {
+        match v.get(k)? {
+            Value::Number(n) => n.as_f64().map(|x| (x, false)),
+            Value::String(s) => {
+                let s = s.trim();
+                if let Some(p) = s.strip_suffix('%') {
+                    p.trim().parse::<f64>().ok().map(|x| (x, true))
+                } else {
+                    s.parse::<f64>().ok().map(|x| (x, false))
+                }
+            }
+            _ => None,
+        }
+    }
+    let num = |k: &str| v.get(k).and_then(Value::as_f64);
+    let flag = |k: &str| v.get(k).and_then(Value::as_bool);
+    TextData {
+        font_family: v.get("fontFamily").and_then(Value::as_str).map(str::to_owned),
+        font_style: v.get("fontStyle").and_then(Value::as_str).map(str::to_owned),
+        font_size: num("fontSize"),
+        line_height: num_or_pct(v, "lineHeight"),
+        letter_spacing: num_or_pct(v, "letterSpacing"),
+        paragraph_spacing: num("paragraphSpacing"),
+        auto_resize: one(v, "textAutoResize", &["none", "height", "widthAndHeight", "truncate"]),
+        align_h: one(v, "textAlign", &["left", "center", "right", "justified"]),
+        align_v: one(v, "textAlignVertical", &["top", "middle", "bottom"]),
+        decoration: one(v, "textDecoration", &["none", "underline", "strikethrough"]),
+        decoration_style: one(v, "textDecorationStyle", &["solid", "dotted", "wavy"]),
+        decoration_thickness: num("textDecorationThickness"),
+        decoration_skip_ink: flag("textDecorationSkipInk"),
+        case: one(v, "textCase", &["original", "upper", "lower", "title", "smallCaps"]),
+        leading_trim: one(v, "leadingTrim", &["none", "capHeight"]),
+        list_style: one(v, "listStyle", &["none", "bulleted", "numbered"]),
+        paragraph_indent: num("paragraphIndent"),
+        hanging_punctuation: flag("hangingPunctuation"),
+        hanging_list: flag("hangingList"),
+        wrap_style: one(v, "wrapStyle", &["auto", "balance", "pretty"]),
+        max_lines: v.get("maxLines").and_then(Value::as_u64).map(|x| x as u32),
+        ..TextData::default()
+    }
+}
+
+/// 文本样式的 Type settings 用**改写队列**：这批行都是写死的 `node.set { props }`，
+/// 而样式编辑器必须写回 `style.update`（否则写到了当前选中的节点上，关掉面板就全丢）。
+///
+/// 改写只发生在样式自己的 Type settings 窗口里 —— 队列是派生出来的，外层按钮照旧。
+fn style_write_queue(cmds: &Cmds, style_id: String, text: Rc<RefCell<Value>>) -> Cmds {
+    let map: Rc<dyn Fn(Cmd) -> Cmd> = Rc::new(move |mut cmd: Cmd| {
+        if cmd.id != "node.set" {
+            return cmd;
+        }
+        let Some(props) = cmd.params.take().and_then(|p| p.get("props").cloned()) else {
+            return Cmd { id: "style.update".into(), params: Some(json!({ "style": style_id, "value": text.borrow().clone() })) };
+        };
+        // 合并进样式的 text 对象后整份写回（`style.update` 的 `value` 是整值，不是补丁）。
+        let updated = {
+            let mut v = text.borrow_mut();
+            if let (Some(dst), Some(src)) = (v.as_object_mut(), props.as_object()) {
+                for (k, val) in src {
+                    dst.insert(k.clone(), val.clone());
+                }
+            }
+            v.clone()
+        };
+        Cmd { id: "style.update".into(), params: Some(json!({ "style": style_id, "value": updated })) }
+    });
+    cmds.mapped(map)
 }
 
 impl WindowState {
@@ -270,6 +703,7 @@ impl WindowState {
             pad: popover::SLOT_PAD,
             surface: Surface::Panel,
             height: 240.0,
+            measured_h: Rc::new(Cell::new(0.0)),
             place: None,
             origin: Point { x: px(0.0), y: px(0.0) },
             viewport: size(px(0.0), px(0.0)),
@@ -282,6 +716,7 @@ impl WindowState {
             search: None,
             query: Rc::new(RefCell::new(String::new())),
             color: None,
+            style_edit: None,
             editor: None,
             variables_data: None,
             editor_full: None,
@@ -513,14 +948,14 @@ impl WindowState {
     //   * `Variable` 页在 egui 里是滑杆；控件库没有滑杆，改用每条轴一个数字框（同样是通用控件）。
     // 第三页只在字体**确实是可变字体**时出现 —— egui 是把它画成禁用页签，通用页签没有禁用态，
     // 于是缺省就不出现，避免留一个点不动的死页签。
-    pub(crate) fn type_settings(cmds: Cmds, data: &PanelData, cx: &mut App, anchor: Point<Pixels>) -> Self {
+    pub(crate) fn type_settings(cmds: Cmds, text: &TextData, cx: &mut App, anchor: Point<Pixels>) -> Self {
         let mut w = Self::base(WindowKind::TypeSettings, tr("Type settings"), cmds, Open::Anchor(anchor));
         // 卡片 pad=8：标题行（页签）从 y=8 起，与右上角 X（top 8 / 24 高，中心 y=20）垂直居中对齐。
         // 正文另在 settings_element 里补 px(4)，把左右视觉内边距补回 12（见那里的 kind 判断）。
         w.pad = 8.0;
         // Basics 短、Details 长：高度用于抬升/夹取，正文交给滚动容器按内容延展。
         w.height = 520.0;
-        let t = data.text.clone().unwrap_or_default();
+        let t = text.clone();
         let has_variable = !t.axes.is_empty();
         let mut tabs = vec![tr("Basics").into(), tr("Details").into()];
         if has_variable {
@@ -1029,33 +1464,602 @@ impl WindowState {
         w
     }
 
+    // ── ⑦ 本地样式编辑器（lizard `style_picker` 的 4 个全尺寸编辑器）──────────────────────
+    /// 不另写窗口：复用 `WindowState` 通用弹窗卡（标题栏 / 拖动 / clamp）。正文按 lizard
+    /// `style_metadata` + Properties + 属性行的精确 add_space 排布，用 `Setting` 行实现。
+    /// 写回走引擎 `style.update`；删除不在弹窗里（右栏样式行右键菜单 / Del 键），与
+    /// lizard 4 个全尺寸编辑器一致。
+    pub(crate) fn style_editor(
+        cmds: Cmds,
+        cx: &mut App,
+        anchor: Point<Pixels>,
+        title: SharedString,
+        ty: &'static str,
+        id: String,
+        name: String,
+        description: String,
+        properties: Vec<String>,
+        paints: Vec<figcraft_color::Paint>,
+        text: Option<serde_json::Value>,
+        effects: Option<Vec<EffectRow>>,
+        grids: Option<Vec<GridRow>>,
+        popups: crate::panels::PopupReqs,
+    ) -> Self {
+        // lizard `FloatingPanelWidth::Regular` = 304 且 `inner_margin(Margin::ZERO)`：
+        // 面板本身没有内边距，源码里所有 `x + 16` 都是每一行自己加的左缩进。以前设成
+        // width 336 / pad 16，外层 16 与行内 pl(16) 叠加成 32，整张卡片左右都虚胖一圈。
+        let mut w = Self::base(WindowKind::StyleEditor, title, cmds.clone(), Open::Anchor(anchor));
+        w.width = 304.0;
+        w.pad = 0.0;
+        // 卡片高度由内容撑开，这里的值只参与锚点抬升 / 边界 clamp 的估算，必须贴近真实高度，
+        // 写死 640 会把弹窗整体顶到画布上方。按 lizard 各段精确高度累计（含 40 头部）：
+        //   preview 120/152 + 16 + Name 24 + 8 + Desc 24 + 20|24 + 标题 24|32 + 10|8
+        //   + 属性区（行 ×32，text 是 3×24 + 2×8）+ 8 + Delete 24
+        let rows = match ty {
+            "paint" => paints.len().max(1) as f32 * 32.0,
+            "text" => 3.0 * 24.0 + 2.0 * 8.0,
+            "effect" => effects.as_ref().map(|e| e.len().max(1) as f32 * 32.0).unwrap_or(32.0),
+            _ => grids.as_ref().map(|g| g.len().max(1) as f32 * 32.0).unwrap_or(32.0),
+        };
+        let preview_h = if ty == "effect" || ty == "grid" { 152.0 } else { 120.0 };
+        let meta_gap = if ty == "text" { 20.0 } else { 24.0 };
+        let title_h = if ty == "text" { 24.0 } else { 32.0 };
+        let after_title = if ty == "text" { 10.0 } else { 8.0 };
+        // 末尾两段：属性行后的 add_space(8)（text 是 16）+ 卡片底部留白 8；再 +56 让
+        // `open_pos` 的抬升把卡片整体提到浮动工具栏之上（工具栏浮在画布底部约 56pt）。
+        // 底部 Delete 按钮已按 lizard 去掉，所以这里不再有 +24 的按钮行。
+        let tail = if ty == "text" { 16.0 } else { 8.0 };
+        w.height = 40.0 + preview_h + 16.0 + 24.0 + 8.0 + 24.0 + meta_gap + title_h + after_title + rows + tail + 8.0 + 56.0;
+        // 表面色不指定：`Setting` 行 / `TextField` 的墨色与字段底色都按默认 `Surface::Panel`
+        // 调好，调用方指定 surface 会把整套配色打乱。
+
+        let settings = Self::style_editor_settings(cx, ty, id.clone(), name.clone(), description.clone(), paints.clone(), text.clone(), effects.clone(), grids.clone(), cmds.clone());
+        w.style_edit = Some(StyleEditState {
+            id,
+            has_selection: false,
+            paints,
+            text,
+            effects,
+            grids,
+            popups,
+            picker: Rc::new(RefCell::new(None)),
+        });
+        w.settings = Rc::new(RefCell::new(settings));
+        w
+    }
+
+    /// 构造样式编辑器的正文 `settings`（Name / Description / Properties 各属性行）。
+    /// 打开弹窗与命令回写文档后刷新共用同一份逻辑，保证界面与文档一致。
+    fn style_editor_settings(
+        cx: &mut App,
+        ty: &'static str,
+        id: String,
+        name: String,
+        description: String,
+        paints: Vec<figcraft_color::Paint>,
+        text: Option<serde_json::Value>,
+        effects: Option<Vec<EffectRow>>,
+        grids: Option<Vec<GridRow>>,
+        cmds: Cmds,
+    ) -> Vec<Setting> {
+        let name_cmds = cmds.clone();
+        let name_id = id.clone();
+        let name_field = TextField::build(cx, 176.0, move |tf, _| {
+            tf.set_value(name);
+            tf.set_on_commit(move |text, _w, _cx| {
+                let text = text.trim();
+                if !text.is_empty() {
+                    name_cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": name_id, "name": text })) });
+                }
+            });
+        });
+        let desc_cmds = cmds.clone();
+        let desc_id = id.clone();
+        let desc_field = TextField::build(cx, 176.0, move |tf, _| {
+            tf.set_value(description);
+            tf.set_on_commit(move |text, _w, _cx| {
+                desc_cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": desc_id, "description": text })) });
+            });
+        });
+
+        let mut settings: Vec<Setting> = Vec::new();
+        // ① 预览区：color 304×120（内缩 16 后 272×104 **整块**色）；text 304×120 字体采样；
+        //    effect / grid 304×152 棋盘底预览。
+        match ty {
+            "paint" => {
+                if let Some(p) = paints.last() {
+                    settings.push(Setting::PaintPreview { paint: p.clone() });
+                }
+            }
+            "text" => {
+                if let Some(t) = text.clone() {
+                    settings.push(Setting::TextPreview { text: t });
+                }
+            }
+            "effect" => {
+                if let Some(e) = effects.clone() {
+                    let arr: Vec<Value> = e.iter().map(|x| x.effect.clone()).collect();
+                    settings.push(Setting::EffectPreview { effects: Value::Array(arr) });
+                }
+            }
+            _ => {
+                if let Some(g) = grids.clone()
+                    && let Some(first) = g.first()
+                {
+                    settings.push(Setting::GridPreview { grids: first.grids.clone() });
+                }
+            }
+        }
+        // ② `style_metadata`：预览后 add_space(16)，Name 行 304×24，add_space(8)，Description 行。
+        settings.push(Setting::Spacer { tab: 0, h: 16.0 });
+        settings.push(Setting::Field { tab: 0, label: tr("Name").into(), field: name_field });
+        settings.push(Setting::Spacer { tab: 0, h: 8.0 });
+        settings.push(Setting::Field { tab: 0, label: tr("Description").into(), field: desc_field });
+        // ③ Properties：color/effect/grid 是 add_space(24) + 304×32 标题行（行尾「+」）；
+        //    text 是 add_space(20) + 304×24 标题行（无「+」）。
+        settings.push(Setting::Spacer { tab: 0, h: if ty == "text" { 20.0 } else { 24.0 } });
+        let mut section = Setting::SectionTitle {
+            tab: 0,
+            text: tr("Properties").into(),
+            h: if ty == "text" { 24.0 } else { 32.0 },
+            style_id: id.clone(),
+            array: Value::Array(vec![]),
+            menu: vec![],
+            anchor: Rc::new(RefCell::new(None)),
+        };
+        match ty {
+            "paint" => {
+                let paints_json = serde_json::to_value(&paints).unwrap_or(Value::Array(vec![]));
+                if let Setting::SectionTitle { array, menu, .. } = &mut section {
+                    *array = paints_json.clone();
+                    // lizard：Add fill 点击直接追加一个默认灰填充，没有类型菜单。
+                    *menu = vec![(
+                        SharedString::default(),
+                        serde_json::to_value(figcraft_color::Paint::solid(figcraft_color::Color::from_rgba8(0xD9, 0xD9, 0xD9, 255)))
+                            .unwrap_or(Value::Null),
+                    )];
+                }
+                settings.push(section);
+                settings.push(Setting::Spacer { tab: 0, h: 8.0 });
+                for (i, p) in paints.iter().enumerate().rev() {
+                    let hex = p.solid_color().map(|c| c.to_hex()).unwrap_or_default();
+                    let pct = (p.opacity * 100.0).round().clamp(0.0, 100.0) as i64;
+                    let hex_ed = TextEdit::build(cx, |te, _| {
+                        te.set_value(hex);
+                        te.set_readonly(true);
+                    });
+                    let op_ed = TextEdit::build(cx, |te, _| {
+                        te.set_value(format!("{pct}"));
+                        te.set_readonly(true);
+                    });
+                    settings.push(Setting::PaintRow { tab: 0, style_id: id.clone(), index: i, paint: p.clone(), hex_ed, op_ed });
+                }
+            }
+            "text" => {
+                settings.push(section);
+                settings.push(Setting::Spacer { tab: 0, h: 10.0 });
+                // lizard `text_style_editor`：Properties 下三行紧凑控件，无左侧标签。
+                let tid = id.clone();
+                let text_state = Rc::new(RefCell::new(text.clone().unwrap_or(Value::Object(Default::default()))));
+                let tf = text.clone().unwrap_or(Value::Null);
+                let family = Self::json_str_opt(&tf, &["fontFamily", "font_family"]).unwrap_or_default();
+                let style_name = Self::json_str_opt(&tf, &["fontStyle", "font_style"]).unwrap_or_default();
+                let families: Vec<SharedString> = figcraft_text::family_names().into_iter().map(SharedString::from).collect();
+                let font_styles: Vec<SharedString> = figcraft_text::family_styles(&family).into_iter().map(SharedString::from).collect();
+                let size_field = Self::text_number(cx, Self::json_num(&tf, &["fontSize", "font_size"]).unwrap_or(12.0), "font_size", tid.clone(), text_state.clone(), cmds.clone());
+                let line_field = Self::text_number_auto(cx, Self::json_num(&tf, &["lineHeight", "line_height"]), "line_height", tid.clone(), text_state.clone(), cmds.clone());
+                let spacing_field = Self::text_number_auto(cx, Self::json_num(&tf, &["letterSpacing", "letter_spacing"]), "letter_spacing", tid.clone(), text_state.clone(), cmds.clone());
+                settings.push(Setting::TextControls {
+                    tab: 0,
+                    family: Rc::new(RefCell::new(SharedString::from(family))),
+                    families,
+                    font_style: Rc::new(RefCell::new(SharedString::from(style_name))),
+                    font_styles,
+                    size_field,
+                    line_field,
+                    spacing_field,
+                    style_id: tid,
+                    text: text_state,
+                    family_anchor: Rc::new(RefCell::new(None)),
+                    style_anchor: Rc::new(RefCell::new(None)),
+                });
+            }
+            "effect" => {
+                if let Some(list) = effects.clone() {
+                    let effects_json = Value::Array(list.iter().map(|x| x.effect.clone()).collect());
+                    if let Setting::SectionTitle { array, menu, .. } = &mut section {
+                        *array = effects_json.clone();
+                        *menu = figcraft_doc::Effect::TYPES
+                            .iter()
+                            .filter_map(|(label, kind)| {
+                                figcraft_doc::Effect::of_type(kind)
+                                    .and_then(|e| serde_json::to_value(e).ok())
+                                    .map(|v| (tr(label).into(), v))
+                            })
+                            .collect();
+                    }
+                    settings.push(section);
+                    settings.push(Setting::Spacer { tab: 0, h: 8.0 });
+                    for (i, e) in list.iter().enumerate().rev() {
+                        settings.push(Setting::EffectRow {
+                            tab: 0,
+                            style_id: id.clone(),
+                            index: i,
+                            label: SharedString::from(e.label.clone()),
+                            ty: e.ty,
+                            visible: e.visible,
+                            effect: e.effect.clone(),
+                            array: effects_json.clone(),
+                            anchor: Rc::new(RefCell::new(None)),
+                        });
+                    }
+                }
+            }
+            _ => {
+                if let Some(list) = grids.clone() {
+                    let grids_json = list.first().map(|g| g.grids.clone()).unwrap_or(Value::Array(vec![]));
+                    if let Setting::SectionTitle { array, menu, .. } = &mut section {
+                        *array = grids_json.clone();
+                        *menu = [
+                            (tr("Grid"), figcraft_doc::LayoutGrid::default()),
+                            (tr("Columns"), figcraft_doc::LayoutGrid::columns()),
+                            (tr("Rows"), figcraft_doc::LayoutGrid::rows()),
+                        ]
+                        .into_iter()
+                        .filter_map(|(label, g)| serde_json::to_value(g).ok().map(|v| (label.into(), v)))
+                        .collect();
+                    }
+                    settings.push(section);
+                    settings.push(Setting::Spacer { tab: 0, h: 8.0 });
+                    for (i, g) in list.iter().enumerate().rev() {
+                        settings.push(Setting::GridRow {
+                            tab: 0,
+                            style_id: id.clone(),
+                            index: i,
+                            label: SharedString::from(g.label.clone()),
+                            visible: g.visible,
+                            grids: grids_json.clone(),
+                            anchor: Rc::new(RefCell::new(None)),
+                        });
+                    }
+                }
+            }
+        }
+        // ④ 底部：4 个全尺寸编辑器在属性之后只有一段 add_space，**没有**底部 Delete 按钮
+        // （删除走右栏样式行的右键菜单 / Del 键；text 编辑器的删除在标题栏）。
+        // lizard：color/effect/grid 是 `add_space(8)`，text 的 `ui.scope` 之后是 `add_space(16)`。
+        settings.push(Setting::Spacer { tab: 0, h: if ty == "text" { 16.0 } else { 8.0 } });
+        settings
+    }
+
+    /// 样式编辑弹窗刷新用的文档快照：命令回写文档后，据此重建正文 `settings`。
+    fn style_snapshot(st: &figcraft_doc::Style) -> StyleSnap {
+        let ty = st.kind.type_name();
+        let (paints, text, effects, grids) = match &st.kind {
+            figcraft_doc::StyleKind::Paint { paints } => (paints.clone(), None, None, None),
+            figcraft_doc::StyleKind::Text { style, .. } => (Vec::new(), serde_json::to_value(style).ok(), None, None),
+            figcraft_doc::StyleKind::Effect { effects } => {
+                let list = effects.clone();
+                (
+                    Vec::new(),
+                    None,
+                    Some(list.iter().enumerate().map(|(index, e)| EffectRow {
+                        index,
+                        label: e.label().to_string(),
+                        ty: match e.kind {
+                            figcraft_doc::EffectKind::DropShadow(_) => "dropShadow",
+                            figcraft_doc::EffectKind::InnerShadow(_) => "innerShadow",
+                            figcraft_doc::EffectKind::LayerBlur(_) => "layerBlur",
+                            figcraft_doc::EffectKind::BackgroundBlur(_) => "backgroundBlur",
+                            figcraft_doc::EffectKind::Noise(_) => "noise",
+                            figcraft_doc::EffectKind::Texture(_) => "texture",
+                            figcraft_doc::EffectKind::Glass(_) => "glass",
+                        },
+                        visible: e.visible,
+                        effect: serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+                    }).collect()),
+                    None,
+                )
+            }
+            figcraft_doc::StyleKind::Grid { grids } => {
+                let gl = grids.clone();
+                (
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(gl.iter().enumerate().map(|(index, g)| GridRow {
+                        index,
+                        label: crate::panels::right::data::grid_label(g),
+                        color: g.color.to_hex(),
+                        visible: g.visible,
+                        grids: serde_json::to_value(&gl).unwrap_or(serde_json::Value::Array(vec![])),
+                    }).collect()),
+                )
+            }
+        };
+        StyleSnap { ty, name: st.name.clone(), description: st.description.clone(), paints, text, effects, grids }
+    }
+
+    /// 卡片高度估算（与 `style_editor` 打开时一致）：命令增删属性行后重算，避免卡片定位偏移。
+    fn style_editor_height(ty: &'static str, paints: &[figcraft_color::Paint], _text: &Option<serde_json::Value>, effects: &Option<Vec<EffectRow>>, grids: &Option<Vec<GridRow>>) -> f32 {
+        let rows = match ty {
+            "paint" => paints.len().max(1) as f32 * 32.0,
+            "text" => 3.0 * 24.0 + 2.0 * 8.0,
+            "effect" => effects.as_ref().map(|e| e.len().max(1) as f32 * 32.0).unwrap_or(32.0),
+            _ => grids.as_ref().map(|g| g.len().max(1) as f32 * 32.0).unwrap_or(32.0),
+        };
+        let preview_h = if ty == "effect" || ty == "grid" { 152.0 } else { 120.0 };
+        let meta_gap = if ty == "text" { 20.0 } else { 24.0 };
+        let title_h = if ty == "text" { 24.0 } else { 32.0 };
+        let after_title = if ty == "text" { 10.0 } else { 8.0 };
+        let tail = if ty == "text" { 16.0 } else { 8.0 };
+        40.0 + preview_h + 16.0 + 24.0 + 8.0 + 24.0 + meta_gap + title_h + after_title + rows + tail + 8.0 + 56.0
+    }
+
+    /// 命令回写文档后，用新快照原地重建正文 `settings`（保留位置 / 拖动状态），让界面即时反映。
+    pub(crate) fn apply_style_snapshot(&mut self, cx: &mut App, snap: StyleSnap) {
+        let StyleSnap { ty, name, description, paints, text, effects, grids } = snap;
+        let id = self.style_edit.as_ref().map(|e| e.id.clone()).unwrap_or_default();
+        let settings = Self::style_editor_settings(cx, ty, id.clone(), name, description, paints.clone(), text.clone(), effects.clone(), grids.clone(), self.cmds.clone());
+        self.height = Self::style_editor_height(ty, &paints, &text, &effects, &grids);
+        self.settings = Rc::new(RefCell::new(settings));
+        if let Some(edit) = self.style_edit.as_mut() {
+            edit.paints = paints;
+            edit.text = text;
+            edit.effects = effects;
+            edit.grids = grids;
+        }
+    }
+
+    /// 打开中的样式编辑器对应的 style id（用于命令回写后判断是否刷新）。
+    pub(crate) fn style_id(&self) -> Option<String> {
+        self.style_edit.as_ref().map(|e| e.id.clone())
+    }
+
+    /// 用文档最新状态刷新打开中的样式编辑器：成功返回 `true`；样式已被删除返回 `false`
+    /// （调用方据此关闭弹窗）。命令已执行、文档已更新，这里只是让界面跟上。
+    pub(crate) fn refresh_style(&mut self, cx: &mut App, doc: &figcraft_doc::Document) -> bool {
+        let id = match self.style_edit.as_ref() {
+            Some(e) => e.id.clone(),
+            None => return true,
+        };
+        match doc.style(&id) {
+            Some(st) => {
+                self.apply_style_snapshot(cx, Self::style_snapshot(st));
+                true
+            }
+            None => false,
+        }
+    }
+    /// 文本样式编辑器的数字字段：提交时把整段 `TextStyle` 写回 `style.update {value}`。
+    /// 缺字段会被引擎按默认重置，所以必须整段保留（`text_state`）。
+    fn text_number(
+        cx: &mut App,
+        value: f64,
+        key: &'static str,
+        style_id: String,
+        text_state: Rc<RefCell<serde_json::Value>>,
+        cmds: Cmds,
+    ) -> Entity<TextField> {
+        let field = crate::widgets::number_field(cx, 120.0, Some(value), "", 1.0, Slot::None);
+        let cid = style_id.clone();
+        let ck = key;
+        let cts = text_state.clone();
+        let push = cmds.clone();
+        field.update(cx, move |tf, _| {
+            tf.set_on_commit(move |text, _w, _cx| {
+                let parsed = text.trim().parse::<f64>().ok();
+                let mut v = cts.borrow_mut();
+                match parsed {
+                    Some(n) => v[ck] = json!(n),
+                    None => {
+                        // 字号清空不写回（避免被重置成默认）。
+                        if !(ck == "font_size") {
+                            v[ck] = json!("auto");
+                        }
+                    }
+                }
+                push.push(Cmd { id: "style.update", params: Some(json!({ "style": cid, "value": v.clone() })) });
+            });
+        });
+        field
+    }
+
+    /// 行高 / 字距的空字段：`line_height` 空 → `"auto"`（引擎 `props::line_height` 认），
+    /// `letter_spacing` 空 → `0`（字距没有 auto；写 "auto" 会让 `props::letter_spacing` 解析失败，
+    /// 进而 `style.update` 报错——lizard `parse_letter_spacing` 空串同样得 0）。
+    fn text_number_auto(
+        cx: &mut App,
+        value: Option<f64>,
+        key: &'static str,
+        style_id: String,
+        text_state: Rc<RefCell<serde_json::Value>>,
+        cmds: Cmds,
+    ) -> Entity<TextField> {
+        // 与 `text_number` 同逻辑，只是初始值可能是 None。number_field 对 None 默认给 "Mixed"
+        // 占位，但 lizard 的 `LineHeight::label()` / `LetterSpacing::label()` 分别是 "Auto" / "0%"，
+        // 覆盖占位符以对齐；真正的写回值仍由 on_commit 决定。
+        let field = crate::widgets::number_field(cx, 120.0, value, "", 1.0, Slot::None);
+        if value.is_none() {
+            let hint = if key == "line_height" { tr("Auto") } else { tr("0") };
+            field.update(cx, |tf, _| tf.set_placeholder(hint));
+        }
+        let cid = style_id.clone();
+        let ck = key;
+        let cts = text_state.clone();
+        let push = cmds.clone();
+        field.update(cx, move |tf, _| {
+            tf.set_on_commit(move |text, _w, _cx| {
+                let parsed = text.trim().parse::<f64>().ok();
+                let mut v = cts.borrow_mut();
+                match parsed {
+                    Some(n) => v[ck] = json!(n),
+                    None => v[ck] = if ck == "line_height" { json!("auto") } else { json!(0.0) },
+                }
+                push.push(Cmd { id: "style.update", params: Some(json!({ "style": cid, "value": v.clone() })) });
+            });
+        });
+        field
+    }
+
+    /// 从 `TextStyle` JSON 读一个数字字段（camelCase / snake_case 都认；"auto" / 对象返回 None）。
+    fn json_num(v: &Value, keys: &[&str]) -> Option<f64> {
+        for k in keys {
+            if let Some(x) = v.get(*k) {
+                return match x {
+                    Value::Number(n) => n.as_f64(),
+                    Value::String(s) => {
+                        let s = s.trim();
+                        if s.eq_ignore_ascii_case("auto") {
+                            None
+                        } else {
+                            s.trim_end_matches('%').trim().parse().ok()
+                        }
+                    }
+                    Value::Object(o) => o.get("px").and_then(|p| p.as_f64()).or_else(|| o.get("value").and_then(|p| p.as_f64())),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// 从 `TextStyle` JSON 读一个字符串字段（camelCase / snake_case 都认）。
+    fn json_str_opt(v: &Value, keys: &[&str]) -> Option<String> {
+        for k in keys {
+            if let Some(x) = v.get(*k) {
+                return x.as_str().map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
     // ── ③ 颜色选择器弹窗（egui `widgets/colorpicker.rs`, 标题 "Custom"）────────────────────
+    /// The picker's write-back callback: the canvas eyedropper needs it after sampling.
+    pub(crate) fn color_on_pick(&self) -> Option<Rc<dyn Fn(Color32, &mut Window, &mut App)>> {
+        self.color.as_ref().map(|c| c.on_pick.clone())
+    }
+
     pub(crate) fn color(
         cx: &mut App,
         origin: Point<Pixels>,
         current: Color32,
+        paint: Option<PaintPicker>,
         on_pick: Rc<dyn Fn(Color32, &mut Window, &mut App)>,
         cmds: Cmds,
     ) -> Self {
         let mut w = Self::base(WindowKind::Color, tr("Custom"), cmds, Open::Anchor(origin));
-        // egui 的取色器用 `pad(0)` 让 240 pt 的内容贴住窗口；这里同样给 12 pt 内边距，
-        // 内容自己按 240 pt 排（SV 方块 / 色相 / 透明度 / Hex / 页面色板）。
-        w.width = 264.0;
-        w.pad = 12.0;
-        w.height = HEADER_H + 348.0;
+        // Figma 的 paint 面板是 240 宽、上下 8 内边距、左右 0（`raw_components--modalPanel`），
+        // 每一行自己给 8 / 16 的内缩。卡片内边距因此归零，宽度就是面板本身的 240。
+        w.width = 240.0;
+        w.pad = 0.0;
+
+        let grad_sel = Rc::new(Cell::new(0usize));
+        let grad_kind = Rc::new(Cell::new(0usize));
+        let blend_anchor = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let swatch_anchor = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let swatch_set = Rc::new(Cell::new(0u8));
+        // Mirror every write into a shared paint, so the kind / stop editors read the new value
+        // on the very next frame.
+        let paint_state = paint.as_ref().map(|p| Rc::new(RefCell::new(p.paint.clone())));
+        let paint = paint.map(|mut p| {
+            let Some(cell) = paint_state.clone() else { return p };
+            let outer = p.on_write.clone();
+            p.on_write = Rc::new(move |np, w, cx| {
+                *cell.borrow_mut() = np.clone();
+                outer(np, w, cx);
+            });
+            p
+        });
+        let cur = Rc::new(Cell::new(current));
+        let model = Rc::new(Cell::new(0usize));
+        let model_anchor = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let shown = Rc::new(Cell::new((usize::MAX, [0u8; 4])));
+        // Every pick updates the shared colour first, so the SV square / hue / alpha strips
+        // repaint from the new value instead of staying frozen at the colour they opened with.
+        // Picks also feed the session-wide "Recent" row (ui-egui `remember_recent`).
+        let pick: Rc<dyn Fn(Color32, &mut Window, &mut App)> = {
+            let cur = cur.clone();
+            Rc::new(move |c: Color32, window: &mut Window, cx: &mut App| {
+                cur.set(c);
+                remember_recent(c);
+                on_pick(c, window, cx);
+            })
+        };
+
+        // Hex / CSS text field.
         let hex = TextField::build(cx, 240.0, |tf, _| {
             tf.set_value(current.to_hex());
             tf.set_placeholder("Hex");
         });
-        let commit = on_pick.clone();
-        hex.update(cx, move |tf, _| {
-            tf.set_on_commit(move |text, window, cx| {
-                if let Some(c) = Color32::from_hex(text) {
-                    commit(c, window, cx);
-                }
+        {
+            let commit = pick.clone();
+            let hm = model.clone();
+            hex.update(cx, move |tf, _| {
+                tf.set_on_commit(move |text, window, cx| {
+                    if COLOR_MODELS.get(hm.get()) == Some(&"CSS") {
+                        if let Some(c) = figcraft_color::Color::parse_css(text) {
+                            commit(picker_c32(c), window, cx);
+                        }
+                    } else if let Some(c) = Color32::from_hex(text) {
+                        commit(c, window, cx);
+                    }
+                });
             });
+        }
+
+        // Three numeric fields, one per channel of the active model.
+        let fields: [Entity<TextField>; 3] = std::array::from_fn(|k| {
+            let tf = crate::widgets::number_field(cx, 31.0, None, "", 1.0, Slot::None);
+            let commit = pick.clone();
+            let m = model.clone();
+            let c = cur.clone();
+            tf.update(cx, move |tf, _| {
+                tf.set_on_commit(move |text, window, cx| {
+                    let Ok(x) = text.trim().parse::<f64>() else { return };
+                    let mm = m.get();
+                    let Some(mut vals) = model_values(mm, c.get()) else { return };
+                    vals[k] = clamp_model_value(mm, k, x);
+                    commit(model_color(mm, vals, c.get()), window, cx);
+                });
+            });
+            tf
         });
-        w.color = Some(ColorState { current, hex, on_pick });
+
+        // Alpha percentage.
+        let alpha = TextField::build(cx, 44.0, |tf, _| tf.set_placeholder("%"));
+        {
+            let commit = pick.clone();
+            let c = cur.clone();
+            alpha.update(cx, move |tf, _| {
+                tf.set_on_commit(move |text, window, cx| {
+                    let Ok(x) = text.trim().trim_end_matches('%').trim().parse::<f64>() else { return };
+                    let a = ((x / 100.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    commit(c.get().with_alpha(a), window, cx);
+                });
+            });
+        }
+
+        w.color = Some(ColorState {
+            current: cur,
+            paint,
+            paint_state,
+            grad_sel,
+            grad_kind,
+            swatch_set,
+            swatch_anchor,
+            blend_anchor,
+            model,
+            model_anchor,
+            shown,
+            hex,
+            fields,
+            alpha,
+            on_pick: pick,
+        });
+        // 卡片高度按面板实际内容算（见 `color_card_height`），`render` 每帧会再同步一次，
+        // 所以纯色 ↔ 渐变、色板行数变化时卡片会自己长/缩。
+        w.height = w.color_card_height();
         w
     }
 
@@ -1103,6 +2107,39 @@ impl WindowState {
         self.hold.end();
     }
 
+    // ── 子浮层（属性行点开的取色器 / 排版设置）的**独立**拖动 ────────────────────────────
+    //
+    // 子浮层挂在 `StyleEditState.picker`（`Rc<RefCell<..>>`）上，不占 root 的 `popup` 单槽，
+    // 所以它有**自己的** `hold` / `place`：拖它只挪它自己，父卡片一动不动
+    // （用户 2026-11-15：「打开的第 2 个窗口没有办法拖动，跟他绑死在一起了」）。
+    // 下面几个访问器都借 `&self` + 内部 `RefCell`，好让根视图的窗口级 move / up 直接路由进来。
+    /// 借进 `picker` 跑一段（子浮层存在时才执行）。渲染期它被临时取出来，这里会返回 `None`。
+    fn with_sub<R>(&self, f: impl FnOnce(&mut WindowState) -> R) -> Option<R> {
+        let slot = self.style_edit.as_ref()?.picker.clone();
+        let mut b = slot.borrow_mut();
+        b.as_mut().map(|c| f(c.as_mut()))
+    }
+    /// 子浮层已按下但还没越过死区。
+    pub(crate) fn sub_pending(&self) -> bool {
+        self.with_sub(|c| c.pending().is_some()).unwrap_or(false)
+    }
+    /// 子浮层正在被拖动。
+    pub(crate) fn sub_dragging(&self) -> bool {
+        self.with_sub(|c| c.dragging()).unwrap_or(false)
+    }
+    /// 子浮层按下：只记状态、不重绘（与 `press` 同一套 `hold_drag`，但写它自己的 `origin`）。
+    pub(crate) fn sub_press(&self, at: Point<Pixels>) {
+        let _ = self.with_sub(|c| c.press(at));
+    }
+    /// 子浮层移动：写回它自己的 `place`，父卡片的 `place` 完全不碰。
+    pub(crate) fn sub_move_drag(&self, at: Point<Pixels>) -> bool {
+        self.with_sub(|c| c.move_drag(at)).unwrap_or(false)
+    }
+    /// 子浮层收尾（抬起 / 窗口外松手 / Escape）。
+    pub(crate) fn sub_end_drag(&self) {
+        let _ = self.with_sub(|c| c.end_drag());
+    }
+
     /// 仅供端到端测试读取拖拽后的卡片原点（窗口坐标）。
     #[cfg(test)]
     pub(crate) fn test_origin(&self) -> Point<Pixels> {
@@ -1125,7 +2162,7 @@ impl WindowState {
         match self.kind {
             // A custom title: the current colour's swatch beside the usual label.
             WindowKind::Color => {
-                let c = self.color.as_ref().map(|c| c.current).unwrap_or(Color32::BLACK);
+                let c = self.color.as_ref().map(|c| c.current.get()).unwrap_or(Color32::BLACK);
                 div()
                     .flex()
                     .flex_row()
@@ -1175,7 +2212,9 @@ impl WindowState {
             }
             // 变量编辑器把「标题 + 计数」画进自己的工具条：整窗一个插槽，顶部只有一行。
             WindowKind::VariablesTable => div().into_any_element(),
-            WindowKind::Layout | WindowKind::Stroke | WindowKind::EffectSettings => title_text(self.title.clone()).into_any_element(),
+            WindowKind::Layout | WindowKind::Stroke | WindowKind::EffectSettings | WindowKind::StyleEditor => {
+                title_text(self.title.clone()).into_any_element()
+            }
             // Type settings 的标题栏就是三页签（截图顶部没有单独的 "Type settings" 标题文字），
             // 与 lizard `type_settings_panel` 把 Tabs 放进 header 一致。
             WindowKind::TypeSettings => {
@@ -1217,11 +2256,37 @@ impl WindowState {
     }
 
     // ── body slot ───────────────────────────────────────────────────────────────────────────
+    /// 取色器卡片的当前高度：Figma 面板是「内容自然高度」，所以这里按行累加，而不是写死。
+    /// 渐变模式会多出「渐变类型 + 停靠点条」两段，色板行数随当前色板集变化。
+    fn color_card_height(&self) -> f32 {
+        let Some(c) = self.color.as_ref() else { return HEADER_H + 500.0 };
+        // 上下各 8 + 对比度 48 + 色域 208 + 滑轨 48 + 数值 40
+        let mut h = 8.0 + 48.0 + SPECTRUM + 48.0 + 40.0 + 8.0;
+        if c.paint.is_some() {
+            h += 40.0;
+        }
+        let grad = matches!(
+            c.paint_state.as_ref().map(|s| s.borrow().kind.clone()),
+            Some(figcraft_color::PaintKind::Gradient(_))
+        );
+        if grad {
+            // 渐变类型行 24（pt 4）+ 停靠点条 64（pt 8；ramp 16 + 4 + stops 18 + 4 + 按钮 22）
+            h += 4.0 + 24.0 + 8.0 + 64.0;
+        }
+        let n = page_colors().len().max(recent_colors().len());
+        let rows = n.div_ceil(CHITS_PER_ROW).clamp(1, 3) as f32;
+        // 顶边 1 + 上 11 + 下拉 24 + 下 4 + 色块 rows×24 − 末行 8 + 底部 12
+        h += 1.0 + 11.0 + 24.0 + 4.0 + rows * CHIT_PITCH - (CHIT_PITCH - CHIT) + 12.0;
+        HEADER_H + h
+    }
+
     /// `body_h` = 通用窗口留给 body 的高度（Full 时是整个视口减去 header）。
     fn body_element(&mut self, cx: &mut App, body_h: f32, card_w: f32, viewport: Size<Pixels>) -> AnyElement {
         match self.kind {
-            WindowKind::Color => self.color_body(),
-            WindowKind::Layout | WindowKind::Stroke | WindowKind::TypeSettings | WindowKind::EffectSettings => self.settings_element(cx),
+            WindowKind::Color => self.color_body(cx),
+            WindowKind::Layout | WindowKind::Stroke | WindowKind::TypeSettings | WindowKind::EffectSettings | WindowKind::StyleEditor => {
+                self.settings_element(cx)
+            }
             WindowKind::Variables | WindowKind::TextStyles => self.list_element(cx),
             WindowKind::VariablesTable => {
                 if self.editor.is_none() {
@@ -1246,178 +2311,731 @@ impl WindowState {
         }
     }
 
-    /// 取色器的主体：直接画在通用窗口的 body 插槽里（不再套一层旧取色器卡片）。
-    /// 尺寸沿用 `ui-egui::colorpicker`：240 pt 宽的行、12 段色相、棋盘透明度、Hex、页面色板。
-    fn color_body(&self) -> AnyElement {
+    // ── 取色器（Figma UI3 paint 面板 1:1 还原）────────────────────────────────────────────
+    // 全部数值取自 `Figma – Figma.html` 快照里的 DOM 与 `figma_app-*.css`，不是从截图量的：
+    //   面板 240 宽、上下 8          `raw_components--modalPanel--CWaX0{width:240px;padding:8px 0}`
+    //   类型条 40 高、padding 8、底边 1  `color_picker_v2--typeAndBlendMode--VVL-m`
+    //   类型按钮 24×24、圆角 5          `paint_type_group_tabs--fillTypeButton--9gjgS`
+    //   对比度行 48 高、左右 8          `color_contrast_info--colorContrastRowBase--C4Y1J`
+    //   色域 208×208、圆角 5、1 px 描边  `color_controls--colorSpectrumWrapper--pdxO1` + `_1t0vmmd4`
+    //   控制行左右 16、gap 12           `color_controls--controls--U5kBU`
+    //   滑轨 16 高、全圆角、1 px 描边    `_1byqy9f5` / `_1byqy9f6`
+    //   数值行 40 高、grid 56 + 1fr     `color_controls--colorFormatRow--QKcGI`
+    //   色板顶边 1 px、上 11、色块 16     `library_color_swatch--panel--NcpH0` / `chit--chit---D2JR`
+
+    fn color_body(&mut self, cx: &mut App) -> AnyElement {
         let Some(c) = &self.color else { return div().into_any_element() };
         let t = tokens();
-        let current = c.current;
-        let hsb = figcraft_color::Hsb::from_color(figcraft_color::Color::from_rgba8(current.0[0], current.0[1], current.0[2], current.0[3]));
+        let current = c.current.get();
+        let model = c.model.get();
+        // Only write the fields when the model or the colour actually changed: rewriting them
+        // every frame would erase what the user is typing.
+        if c.shown.get() != (model, current.0) {
+            c.shown.set((model, current.0));
+            match model_values(model, current) {
+                Some(vals) => {
+                    for (k, f) in c.fields.iter().enumerate() {
+                        let d = model_decimals(model, k);
+                        let text = format!("{:.*}", d, vals[k]);
+                        f.update(cx, |tf, _| tf.set_value(text));
+                    }
+                }
+                None => {
+                    let text = if COLOR_MODELS.get(model) == Some(&"CSS") {
+                        picker_color(current).to_css()
+                    } else {
+                        current.to_hex()
+                    };
+                    c.hex.update(cx, |tf, _| tf.set_value(text));
+                }
+            }
+            let a = (f64::from(current.0[3]) / 255.0 * 100.0).round() as u32;
+            c.alpha.update(cx, |tf, _| tf.set_value(a.to_string()));
+        }
+        let hsb = figcraft_color::Hsb::from_color(picker_color(current));
         let hue = hsb.h;
+        let alpha = f32::from(current.0[3]) / 255.0;
         let pick = c.on_pick.clone();
+        // Eyedropper: sample on the canvas; the sample comes back through `tool.picked`.
+        let eyedrop_cmds = self.cmds.clone();
 
-        // ① 饱和度 / 明度方块：两个线性渐变 quad（底层 白→色相，上层 透明→黑）。
-        //    原来是 24×18 = 432 个逐格 quad，再叠上百个棋盘格 —— 拖动这张卡片时每帧要画
-        //    上千个 quad，是「拖动卡」的主要来源。GPUI 的 linear_gradient 一次就能画整块。
+        // ① 色域方块：两个线性渐变 quad（底层 白→色相，上层 透明→黑）。
         //    prepaint 记下盒子在窗口中的位置，点击时按相对坐标取 s / v。
         let sv_hit: Rc<std::cell::Cell<Option<Bounds<Pixels>>>> = Rc::new(std::cell::Cell::new(None));
         let sv_prepaint = sv_hit.clone();
         let sv_click = sv_hit.clone();
         let sv_pick = pick.clone();
         let hue_c = hsb_color(hue, 1.0, 1.0);
-        let sv = div()
-            .w(pt(240.0))
-            .h(pt(180.0))
-            .rounded(pt(4.0))
-            .overflow_hidden()
+        let spectrum = div()
+            .relative()
+            .w(pt(SPECTRUM))
+            .h(pt(SPECTRUM))
             .child(
-                gpui::canvas(
-                    move |bounds, _, _| sv_prepaint.set(Some(bounds)),
-                    move |bounds, _, window, _| {
-                        let white = gpui::Hsla::from(rgba(Color32::from_rgb(255, 255, 255)));
-                        let pure = gpui::Hsla::from(rgba(hue_c));
-                        let clear = gpui::transparent_black();
-                        let black = gpui::Hsla::from(rgba(Color32::from_rgb(0, 0, 0)));
-                        // 90° = 左→右（饱和度 0→1），180° = 上→下（明度 1→0）。
-                        window.paint_quad(gpui::fill(
-                            bounds,
-                            gpui::linear_gradient(90.0, gpui::linear_color_stop(white, 0.0), gpui::linear_color_stop(pure, 1.0)),
-                        ));
-                        window.paint_quad(gpui::fill(
-                            bounds,
-                            gpui::linear_gradient(180.0, gpui::linear_color_stop(clear, 0.0), gpui::linear_color_stop(black, 1.0)),
-                        ));
-                    },
-                )
-                .size_full(),
+                div()
+                    .w(pt(SPECTRUM))
+                    .h(pt(SPECTRUM))
+                    .rounded(pt(5.0))
+                    .border_1()
+                    .border_color(rgba(t.border))
+                    .overflow_hidden()
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| sv_prepaint.set(Some(bounds)),
+                            move |bounds, _, window, _| {
+                                let white = gpui::Hsla::from(rgba(Color32::from_rgb(255, 255, 255)));
+                                let pure = gpui::Hsla::from(rgba(hue_c));
+                                let clear = gpui::transparent_black();
+                                let black = gpui::Hsla::from(rgba(Color32::from_rgb(0, 0, 0)));
+                                // 90° = 左→右（饱和度 0→1），180° = 上→下（明度 1→0）。
+                                window.paint_quad(gpui::fill(
+                                    bounds,
+                                    gpui::linear_gradient(90.0, gpui::linear_color_stop(white, 0.0), gpui::linear_color_stop(pure, 1.0)),
+                                ));
+                                window.paint_quad(gpui::fill(
+                                    bounds,
+                                    gpui::linear_gradient(180.0, gpui::linear_color_stop(clear, 0.0), gpui::linear_color_stop(black, 1.0)),
+                                ));
+                            },
+                        )
+                        .size_full(),
+                    )
+                    .on_mouse_down(MouseButton::Left, move |e, window, cx| {
+                        let Some(b) = sv_click.get() else { return };
+                        let s = ((f32::from(e.position.x) - f32::from(b.origin.x)) / f32::from(b.size.width).max(1.0)).clamp(0.0, 1.0);
+                        let v = 1.0 - ((f32::from(e.position.y) - f32::from(b.origin.y)) / f32::from(b.size.height).max(1.0)).clamp(0.0, 1.0);
+                        sv_pick(hsb_color(hue, s, v), window, cx);
+                    }),
             )
-            .on_mouse_down(MouseButton::Left, move |e, window, cx| {
-                let Some(b) = sv_click.get() else { return };
-                let s = ((f32::from(e.position.x) - f32::from(b.origin.x)) / f32::from(b.size.width).max(1.0)).clamp(0.0, 1.0);
-                let v = 1.0 - ((f32::from(e.position.y) - f32::from(b.origin.y)) / f32::from(b.size.height).max(1.0)).clamp(0.0, 1.0);
-                sv_pick(hsb_color(hue, s, v), window, cx);
-            });
+            // 拾色点：Figma `_1t0vmmd5/7` 是 16 pt 白环 + 4 pt 白边 + 中间填当前色，
+            // 环外还有一圈 1 px `controlknoboffoutline`（这里用 18 pt 半透明底托出来）。
+            .child(picker_knob(hsb.s * SPECTRUM, (1.0 - hsb.b) * SPECTRUM, current.with_alpha(255)));
 
-        // ② 色相条：6 段渐变（每段两个色标），整条命中按 x 比例取色相。
-        //    12 个带独立 hitbox 的 div 换成 6 个 quad，重绘和命中都轻得多。
+        // ② 色相滑轨：16 高、全圆角；轨道左右各外扩 8（Figma 的 `::before{inset:0 -8px}`），
+        //    滑块在 0% / 100% 时正好压在轨道端盖上，而不是被端盖切掉。
         let hue_hit: Rc<std::cell::Cell<Option<Bounds<Pixels>>>> = Rc::new(std::cell::Cell::new(None));
-        let hue_prepaint = hue_hit.clone();
+        let hue_probe = hue_hit.clone();
         let hue_click = hue_hit.clone();
         let hue_pick = pick.clone();
-        let hue_row = div()
-            .w(pt(240.0))
-            .h(pt(20.0))
-            .rounded(pt(4.0))
-            .overflow_hidden()
-            .cursor_pointer()
+        let hue_slider = div()
+            .w_full()
+            .h(pt(16.0))
+            .relative()
+            .child(bounds_probe(hue_probe))
             .child(
-                gpui::canvas(
-                    move |bounds, _, _| hue_prepaint.set(Some(bounds)),
-                    move |bounds, _, window, _| {
-                        let x0 = f32::from(bounds.origin.x);
-                        let y0 = f32::from(bounds.origin.y);
-                        let w = f32::from(bounds.size.width).max(1.0);
-                        let h = f32::from(bounds.size.height).max(1.0);
-                        for i in 0..6 {
-                            let a = hsb_color(i as f32 * 60.0, 1.0, 1.0);
-                            let b = hsb_color((i + 1) as f32 * 60.0, 1.0, 1.0);
-                            window.paint_quad(gpui::fill(
-                                Bounds { origin: point(px(x0 + w * i as f32 / 6.0), px(y0)), size: size(px(w / 6.0), px(h)) },
-                                gpui::linear_gradient(
-                                    90.0,
-                                    gpui::linear_color_stop(gpui::Hsla::from(rgba(a)), 0.0),
-                                    gpui::linear_color_stop(gpui::Hsla::from(rgba(b)), 1.0),
-                                ),
-                            ));
-                        }
-                    },
-                )
-                .size_full(),
+                div()
+                    .absolute()
+                    .left(px(-8.0))
+                    .right(px(-8.0))
+                    .top_0()
+                    .h(pt(16.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(Color32::from_black_alpha(51)))
+                    .overflow_hidden()
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let x0 = f32::from(bounds.origin.x);
+                                let y0 = f32::from(bounds.origin.y);
+                                let w = f32::from(bounds.size.width).max(1.0);
+                                let h = f32::from(bounds.size.height).max(1.0);
+                                for i in 0..6 {
+                                    let a = hsb_color(i as f32 * 60.0, 1.0, 1.0);
+                                    let b = hsb_color((i + 1) as f32 * 60.0, 1.0, 1.0);
+                                    window.paint_quad(gpui::fill(
+                                        Bounds {
+                                            origin: point(px(x0 + w * i as f32 / 6.0), px(y0)),
+                                            size: size(px(w / 6.0 + 0.5), px(h)),
+                                        },
+                                        gpui::linear_gradient(
+                                            90.0,
+                                            gpui::linear_color_stop(gpui::Hsla::from(rgba(a)), 0.0),
+                                            gpui::linear_color_stop(gpui::Hsla::from(rgba(b)), 1.0),
+                                        ),
+                                    ));
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
             )
+            .child(picker_knob(hue / 360.0 * SLIDER_W, 0.0, hue_c))
             .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                 let Some(b) = hue_click.get() else { return };
                 let f = ((f32::from(e.position.x) - f32::from(b.origin.x)) / f32::from(b.size.width).max(1.0)).clamp(0.0, 1.0);
                 hue_pick(hsb_color(f * 360.0, 1.0, 1.0), window, cx);
             });
 
-        // ③ 透明度：8pt 棋盘 + 一个 透明→当前色 的水平渐变 quad（原来 24 段 + 4pt 棋盘）。
+        // ③ 透明度滑轨：棋盘 + 透明→当前色 的水平渐变。
         let alpha_hit: Rc<std::cell::Cell<Option<Bounds<Pixels>>>> = Rc::new(std::cell::Cell::new(None));
-        let alpha_prepaint = alpha_hit.clone();
+        let alpha_probe = alpha_hit.clone();
         let alpha_click = alpha_hit.clone();
-        let alpha = div()
-            .w(pt(240.0))
-            .h(pt(20.0))
-            .rounded(pt(4.0))
-            .overflow_hidden()
+        let opaque = current.with_alpha(255);
+        let alpha_slider = div()
+            .w_full()
+            .h(pt(16.0))
+            .relative()
+            .child(bounds_probe(alpha_probe))
             .child(
-                gpui::canvas(
-                    move |bounds, _, _| alpha_prepaint.set(Some(bounds)),
-                    move |bounds, _, window, _| {
-                        crate::widgets::swatch::checker(window, bounds, 8.0);
-                        let opaque = gpui::Hsla::from(rgba(current.with_alpha(255)));
-                        window.paint_quad(gpui::fill(
-                            bounds,
-                            gpui::linear_gradient(
-                                90.0,
-                                gpui::linear_color_stop(gpui::transparent_black(), 0.0),
-                                gpui::linear_color_stop(opaque, 1.0),
-                            ),
-                        ));
-                    },
-                )
-                .size_full(),
+                div()
+                    .absolute()
+                    .left(px(-8.0))
+                    .right(px(-8.0))
+                    .top_0()
+                    .h(pt(16.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(Color32::from_black_alpha(51)))
+                    .overflow_hidden()
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                crate::widgets::swatch::checker(window, bounds, 4.0);
+                                window.paint_quad(gpui::fill(
+                                    bounds,
+                                    gpui::linear_gradient(
+                                        90.0,
+                                        gpui::linear_color_stop(gpui::transparent_black(), 0.0),
+                                        gpui::linear_color_stop(gpui::Hsla::from(rgba(opaque)), 1.0),
+                                    ),
+                                ));
+                            },
+                        )
+                        .size_full(),
+                    ),
             )
+            .child(picker_knob(alpha * SLIDER_W, 0.0, opaque))
             .on_mouse_down(MouseButton::Left, {
                 let p = pick.clone();
+                let opaque = opaque;
                 move |e, window, cx| {
                     let Some(b) = alpha_click.get() else { return };
                     let a = ((f32::from(e.position.x) - f32::from(b.origin.x)) / f32::from(b.size.width).max(1.0)).clamp(0.0, 1.0);
-                    p(current.with_alpha((a * 255.0).round() as u8), window, cx);
+                    p(opaque.with_alpha((a * 255.0).round() as u8), window, cx);
                 }
             });
 
-        // ④ Hex 输入框（提交即写回）。
-        // ⑤ 页面色板：12 个纯色块，点一个即应用。
-        let palette: [Color32; 12] = [
-            Color32::from_rgb(0x00, 0x00, 0x00),
-            Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            Color32::from_rgb(0xEB, 0x4D, 0x4D),
-            Color32::from_rgb(0xF5, 0xA6, 0x23),
-            Color32::from_rgb(0x4C, 0xAF, 0x50),
-            Color32::from_rgb(0x2D, 0x9C, 0xDB),
-            Color32::from_rgb(0x5B, 0x8D, 0xE6),
-            Color32::from_rgb(0x9B, 0x59, 0xB6),
-            Color32::from_rgb(0x34, 0x49, 0x5E),
-            Color32::from_rgb(0x7F, 0x8C, 0x8D),
-            Color32::from_rgb(0xE9, 0x1E, 0x63),
-            Color32::from_rgb(0x00, 0xBF, 0xA5),
-        ];
-        let mut grid = div().w(pt(240.0)).grid().grid_cols(6).gap(pt(6.0));
-        for col in palette {
-            let p = pick.clone();
-            grid = grid.child(
+        // ④ 数值行：格式下拉 56 + 三个通道字段（1fr）+ 不透明度 54，字段高 24。
+        let model_name = COLOR_MODELS.get(model).copied().unwrap_or("Hex");
+        let model_trigger = c.model_anchor.clone();
+        let model_hit: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let format_select = div()
+            .relative()
+            .flex_none()
+            .w(pt(56.0))
+            .h(pt(24.0))
+            .pl(pt(8.0))
+            .rounded(pt(5.0))
+            .border_1()
+            .border_color(rgba(t.border))
+            .bg(rgba(t.panel))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(t.hover)))
+            .child(div().flex_1().min_w(pt(0.0)).overflow_hidden().text_size(pt(11.0)).text_color(rgba(t.text)).child(model_name))
+            .child(picker_icons::paint(PickerIcon::Chevron, rgba(t.icon), 24.0))
+            .child(bounds_probe(model_hit.clone()))
+            .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                if let Some(b) = model_hit.get() {
+                    model_trigger.set(Some(b));
+                    window.refresh();
+                }
+            });
+        let mut fields_row = div().flex_1().min_w(pt(0.0)).h(pt(24.0)).flex().flex_row().items_center().gap(pt(1.0));
+        let cell = |e: AnyElement| div().flex_1().min_w(pt(0.0)).h(pt(24.0)).rounded(pt(5.0)).bg(rgba(t.field)).child(e);
+        if model_values(model, current).is_some() {
+            for f in &c.fields {
+                fields_row = fields_row.child(cell(f.clone().into_any_element()));
+            }
+        } else {
+            fields_row = fields_row.child(cell(c.hex.clone().into_any_element()));
+        }
+        fields_row = fields_row.child(
+            div()
+                .flex_none()
+                .w(pt(54.0))
+                .h(pt(24.0))
+                .rounded(pt(5.0))
+                .bg(rgba(t.field))
+                .child(c.alpha.clone()),
+        );
+
+        // ⑤ 色板：色板集下拉 + 16 pt 色块（节奏 24，一行 9 个，与 Figma 的 216 内容宽一致）。
+        let set = c.swatch_set.get();
+        let (set_label, set_colors) = if set == 0 { (tr("On this page"), page_colors()) } else { (tr("Recent"), recent_colors()) };
+        let set_trigger = c.swatch_anchor.clone();
+        let set_hit: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let set_select = div()
+            .relative()
+            .w_full()
+            .h(pt(24.0))
+            .pl(pt(8.0))
+            .rounded(pt(5.0))
+            .border_1()
+            .border_color(rgba(t.border))
+            .bg(rgba(t.panel))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(t.hover)))
+            .child(div().flex_1().min_w(pt(0.0)).overflow_hidden().text_size(pt(11.0)).text_color(rgba(t.text)).child(set_label))
+            .child(picker_icons::paint(PickerIcon::Chevron, rgba(t.icon), 24.0))
+            .child(bounds_probe(set_hit.clone()))
+            .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                if let Some(b) = set_hit.get() {
+                    set_trigger.set(Some(b));
+                    window.refresh();
+                }
+            });
+        let mut grid = div().px(pt(12.0)).flex().flex_col().gap(pt(CHIT_PITCH - CHIT));
+        for row in set_colors.chunks(CHITS_PER_ROW) {
+            let mut r = div().flex().flex_row().items_center().gap(pt(CHIT_PITCH - CHIT));
+            for col in row {
+                let p = pick.clone();
+                let col = *col;
+                r = r.child(
+                    crate::widgets::swatch(figcraft_color::Paint::solid(picker_color(col)), CHIT)
+                        .on_click(move |window, cx| p(col, window, cx)),
+                );
+            }
+            grid = grid.child(r);
+        }
+        let swatch_panel = div()
+            .w(pt(PANEL_W))
+            .border_t_1()
+            .border_color(rgba(t.border))
+            .pt(pt(11.0))
+            .child(div().px(pt(16.0)).pb(pt(4.0)).child(set_select))
+            .child(grid)
+            .child(div().h(pt(12.0)));
+
+        // ⑥ 对比度行：Figma `color_contrast_info` 的圆片 + 比值（比的是当前色对本页画布底色）。
+        let ratio = contrast_ratio(current.with_alpha(255), t.canvas);
+        let contrast_row = div()
+            .w(pt(PANEL_W))
+            .h(pt(48.0))
+            .px(pt(8.0))
+            .flex()
+            .items_center()
+            .child(
                 div()
-                    .size(pt(20.0))
+                    .flex()
+                    .items_center()
+                    .gap(pt(5.0))
+                    .child(
+                        div()
+                            .relative()
+                            .w(pt(14.0))
+                            .h(pt(14.0))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(rgba(t.canvas))
+                            .border_1()
+                            .border_color(rgba(Color32::from_black_alpha(38)))
+                            .child(div().absolute().right_0().top_0().w(pt(7.0)).h(pt(14.0)).bg(rgba(current.with_alpha(255)))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .text_size(pt(11.0))
+                            .text_color(rgba(t.text))
+                            .child(format!("{ratio:.2}"))
+                            .child(div().text_color(rgba(t.text_secondary)).child(": 1")),
+                    ),
+            );
+
+        // ── 组装（顺序与 Figma 一致：类型条 → 渐变色阶 → 对比度 → 色域 → 滑轨 → 数值 → 色板）
+        let mut col = div().w(pt(PANEL_W)).flex().flex_col().pt(pt(8.0)).pb(pt(8.0));
+        if c.paint.is_some() {
+            col = col.child(self.picker_toolbar(c));
+        }
+        if let (Some(p), Some(state)) = (&c.paint, &c.paint_state) {
+            let grad = match &state.borrow().kind {
+                figcraft_color::PaintKind::Gradient(g) => Some(g.clone()),
+                _ => None,
+            };
+            if let Some(g) = grad {
+                col = col.child(div().px(pt(16.0)).pt(pt(4.0)).child(self.gradient_kind_row(p, state)));
+                col = col.child(div().px(pt(16.0)).pt(pt(8.0)).child(self.gradient_stops(p, state, g, c.grad_sel.clone())));
+            }
+        }
+        col = col.child(contrast_row);
+        col = col.child(div().px(pt(16.0)).child(spectrum));
+        col = col.child(
+            div()
+                .w(pt(PANEL_W))
+                .h(pt(48.0))
+                .px(pt(16.0))
+                .flex()
+                .items_center()
+                .gap(pt(12.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(pt(24.0))
+                        .h(pt(24.0))
+                        .rounded(pt(5.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(t.hover)))
+                        .child(picker_icons::paint(PickerIcon::Dropper, rgba(t.icon), 24.0))
+                        .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                            eyedrop_cmds.push(Cmd { id: "edit.pickColor", params: Some(json!({ "apply": false })) });
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(pt(0.0))
+                        .h(pt(44.0))
+                        .flex()
+                        .flex_col()
+                        .justify_between()
+                        .gap(pt(12.0))
+                        .child(hue_slider)
+                        .child(alpha_slider),
+                ),
+        );
+        col = col.child(
+            div()
+                .w(pt(PANEL_W))
+                .h(pt(40.0))
+                .px(pt(16.0))
+                .flex()
+                .items_center()
+                .gap(pt(8.0))
+                .child(format_select)
+                .child(fields_row),
+        );
+        col = col.child(swatch_panel);
+
+        // The model list is the shared dropdown menu (ui-egui's model dropdown), parked on the
+        // window root so the popover card cannot clip it.
+        if let Some(anchor) = c.model_anchor.get() {
+            let rows: Vec<MenuRow> = COLOR_MODELS
+                .iter()
+                .map(|n| MenuRow { label: (*n).into(), trail: None, checked: Some(*n == model_name), separator_before: false })
+                .collect();
+            let set_model = c.model.clone();
+            let close = c.model_anchor.clone();
+            let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new({
+                let close = close.clone();
+                move |label, _w, _cx| {
+                    if let Some(i) = COLOR_MODELS.iter().position(|n| *n == label) {
+                        set_model.set(i);
+                    }
+                    close.set(None);
+                }
+            });
+            let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_w, _cx| close.set(None));
+            self.overlays.borrow_mut().push(menu_popup_in(
+                anchor,
+                Some(56.0),
+                rows,
+                on_pick,
+                dismiss,
+                f32::from(self.viewport.width),
+                f32::from(self.viewport.height),
+            ));
+        }
+        // The blend-mode menu, on the window root like the model menu.
+        if let Some(anchor) = c.blend_anchor.get()
+            && let (Some(p), Some(state)) = (&c.paint, &c.paint_state)
+        {
+            let current_blend = state.borrow().blend;
+            let rows: Vec<MenuRow> = figcraft_color::BlendMode::ALL
+                .iter()
+                .map(|m| MenuRow { label: m.label().into(), trail: None, checked: Some(*m == current_blend), separator_before: false })
+                .collect();
+            let write = p.on_write.clone();
+            let st = state.clone();
+            let close = c.blend_anchor.clone();
+            let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new({
+                let close = close.clone();
+                move |label, window, cx| {
+                    if let Some(m) = figcraft_color::BlendMode::ALL.iter().find(|m| m.label() == label) {
+                        let mut np = st.borrow().clone();
+                        np.blend = *m;
+                        write(np, window, cx);
+                    }
+                    close.set(None);
+                }
+            });
+            let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_w, _cx| close.set(None));
+            self.overlays.borrow_mut().push(menu_popup_in(
+                anchor,
+                Some(208.0),
+                rows,
+                on_pick,
+                dismiss,
+                f32::from(self.viewport.width),
+                f32::from(self.viewport.height),
+            ));
+        }
+        // The swatch-set menu (在此页面 / 最近使用), same parking rule.
+        if let Some(anchor) = c.swatch_anchor.get() {
+            let rows: Vec<MenuRow> = [("On this page", 0u8), ("Recent", 1u8)]
+                .into_iter()
+                .map(|(name, i)| MenuRow { label: tr(name).into(), trail: None, checked: Some(i == set), separator_before: false })
+                .collect();
+            let set_cell = c.swatch_set.clone();
+            let close = c.swatch_anchor.clone();
+            let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new({
+                let close = close.clone();
+                move |label, _w, _cx| {
+                    let page = tr("On this page");
+                    set_cell.set(if label == page { 0 } else { 1 });
+                    close.set(None);
+                }
+            });
+            let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_w, _cx| close.set(None));
+            self.overlays.borrow_mut().push(menu_popup_in(
+                anchor,
+                Some(PANEL_W),
+                rows,
+                on_pick,
+                dismiss,
+                f32::from(self.viewport.width),
+                f32::from(self.viewport.height),
+            ));
+        }
+        col.into_any_element()
+    }
+
+    /// 填充类型条（Figma `color_picker_v2--typeAndBlendMode`，UI3 版）：
+    /// 纯色 / 渐变两格 24 pt 图标按钮 + 右侧混合模式按钮，底边 1 px 分隔。
+    fn picker_toolbar(&self, c: &ColorState) -> gpui::Div {
+        let t = tokens();
+        let is_grad = matches!(
+            c.paint_state.as_ref().map(|s| s.borrow().kind.clone()),
+            Some(figcraft_color::PaintKind::Gradient(_))
+        );
+        let write = c.paint.as_ref().map(|p| p.on_write.clone());
+        let state = c.paint_state.clone();
+        let grad_kind = c.grad_kind.clone();
+        let mut tabs = div().flex().items_center().gap(pt(4.0));
+        for (i, icon) in [(0usize, PickerIcon::Solid), (1usize, PickerIcon::Gradient)] {
+            let on = (i == 1) == is_grad;
+            let mut b = div()
+                .w(pt(24.0))
+                .h(pt(24.0))
+                .rounded(pt(5.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(t.hover)))
+                .child(picker_icons::paint(icon, rgba(t.icon), 24.0));
+            if on {
+                b = b.bg(rgba(t.hover));
+            }
+            let write_b = write.clone();
+            let state_b = state.clone();
+            let gk = grad_kind.clone();
+            b = b.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                let (Some(w), Some(st)) = (write_b.as_ref(), state_b.as_ref()) else { return };
+                let cur = st.borrow().clone();
+                let base = cur.preview_color();
+                let mut np = cur;
+                np.kind = if i == 0 {
+                    figcraft_color::PaintKind::Solid { color: base }
+                } else {
+                    figcraft_color::PaintKind::Gradient(figcraft_color::Gradient::default_for(GRADIENT_KINDS[gk.get().min(3)], base))
+                };
+                w(np, window, cx);
+            });
+            tabs = tabs.child(b);
+        }
+        // 混合模式：水滴按钮，菜单挂窗口根（与数值行 / 色板下拉同一套锚点）。
+        let blend_trigger = c.blend_anchor.clone();
+        let blend_hit: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let blend_btn = div()
+            .relative()
+            .w(pt(24.0))
+            .h(pt(24.0))
+            .rounded(pt(5.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(t.hover)))
+            .child(picker_icons::paint(PickerIcon::Blend, rgba(t.icon), 24.0))
+            .child(bounds_probe(blend_hit.clone()))
+            .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                if let Some(b) = blend_hit.get() {
+                    blend_trigger.set(Some(b));
+                    window.refresh();
+                }
+            });
+        div()
+            .w(pt(PANEL_W))
+            .h(pt(40.0))
+            .px(pt(8.0))
+            .border_b_1()
+            .border_color(rgba(t.border))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(tabs)
+            .child(div().flex().items_center().gap(pt(4.0)).child(blend_btn))
+    }
+
+    /// 渐变类型：线性 / 径向 / 角度 / 菱形（Figma 渐变面板用分段控件切，这里用通用
+    /// [`Segmented`]，切换即整份 paint 重写）。
+    fn gradient_kind_row(&self, p: &PaintPicker, state: &Rc<RefCell<figcraft_color::Paint>>) -> gpui::Div {
+        let active = match &state.borrow().kind {
+            figcraft_color::PaintKind::Gradient(g) => match g.kind {
+                figcraft_color::GradientKind::Linear => 0,
+                figcraft_color::GradientKind::Radial => 1,
+                figcraft_color::GradientKind::Angular => 2,
+                figcraft_color::GradientKind::Diamond => 3,
+            },
+            _ => 0,
+        };
+        let items: Vec<SegItem> = ["Linear", "Radial", "Angular", "Diamond"].iter().map(|s| SegItem::Text((*s).into())).collect();
+        let write = p.on_write.clone();
+        let st = state.clone();
+        let seg = Segmented::new(items).active(Some(active)).on_pick(move |i, window, cx| {
+            let cur = st.borrow().clone();
+            let base = cur.preview_color();
+            let mut np = cur;
+            np.kind = figcraft_color::PaintKind::Gradient(figcraft_color::Gradient::default_for(GRADIENT_KINDS[i.min(3)], base));
+            write(np, window, cx);
+        });
+        div().w(pt(SPECTRUM)).h(pt(24.0)).child(seg)
+    }
+
+    /// Gradient stops: a 208 pt ramp with draggable handles plus Remove / Flip / Rotate 90°
+    /// (ui-egui's stop bar). Every change is written back as a whole paint.
+    fn gradient_stops(
+        &self,
+        p: &PaintPicker,
+        state: &Rc<RefCell<figcraft_color::Paint>>,
+        g: figcraft_color::Gradient,
+        sel: Rc<Cell<usize>>,
+    ) -> gpui::Div {
+        let t = tokens();
+        let write = p.on_write.clone();
+        let bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let drag = Rc::new(Cell::new(None::<usize>));
+
+        let ramp_g = g.clone();
+        let ramp_bounds = bounds.clone();
+        let ramp = div().w(pt(208.0)).h(pt(16.0)).rounded(pt(4.0)).overflow_hidden().child(
+            gpui::canvas(
+                move |b, _, _| ramp_bounds.set(Some(b)),
+                move |b, _, window, _| {
+                    let w = f32::from(b.size.width).max(1.0);
+                    for i in 0..24 {
+                        let a = (i as f32 + 0.5) / 24.0;
+                        let quad = Bounds {
+                            origin: point(px(f32::from(b.origin.x) + w * i as f32 / 24.0), b.origin.y),
+                            size: size(px(w / 24.0), b.size.height),
+                        };
+                        window.paint_quad(gpui::fill(quad, gpui::Hsla::from(rgba(picker_c32(ramp_g.sample(a).with_alpha(1.0))))));
+                    }
+                },
+            )
+            .size_full(),
+        );
+
+        let mut stops = div().w(pt(208.0)).h(pt(18.0)).relative();
+        for (i, s) in g.stops.iter().enumerate() {
+            let x = (s.position as f32 * 208.0 - 6.0).clamp(-2.0, 194.0);
+            let sel_c = sel.clone();
+            let drag_c = drag.clone();
+            stops = stops.child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(0.0))
+                    .w(pt(12.0))
+                    .h(pt(18.0))
                     .rounded(pt(3.0))
-                    .bg(rgba(col))
+                    .bg(rgba(picker_c32(s.color.with_alpha(1.0))))
                     .border_1()
-                    .border_color(rgba(t.border))
+                    .border_color(rgba(if i == sel.get() { t.text } else { t.border }))
                     .cursor_pointer()
-                    .hover(|s| s.border_color(rgba(t.text)))
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| p(col, window, cx)),
+                    .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                        sel_c.set(i);
+                        drag_c.set(Some(i));
+                    }),
             );
         }
-        div()
-            .w(pt(240.0))
-            .flex()
-            .flex_col()
-            .gap(pt(6.0))
-            .child(sv)
-            .child(hue_row)
-            .child(alpha)
-            .child(div().w(pt(240.0)).h(pt(28.0)).child(c.hex.clone()))
-            .child(grid)
-            .into_any_element()
+        let write_drag = write.clone();
+        let state_drag = state.clone();
+        let drag_d = drag.clone();
+        let drag_up = drag.clone();
+        let bounds_d = bounds.clone();
+        let stops = stops
+            .on_mouse_move(move |e: &MouseMoveEvent, window: &mut Window, cx: &mut App| {
+                let Some(i) = drag_d.get() else { return };
+                let Some(b) = bounds_d.get() else { return };
+                let x = ((f32::from(e.position.x) - f32::from(b.origin.x)) / f32::from(b.size.width).max(1.0)).clamp(0.0, 1.0);
+                let mut np = state_drag.borrow().clone();
+                if let figcraft_color::PaintKind::Gradient(gg) = &mut np.kind
+                    && let Some(st) = gg.stops.get_mut(i)
+                {
+                    st.position = x;
+                }
+                write_drag(np, window, cx);
+            })
+            .on_mouse_up(MouseButton::Left, move |_, _, _| drag_up.set(None));
+
+        // Remove / Flip / Rotate 90° — the same three actions as ui-egui.
+        let mut buttons = div().flex().flex_row().items_center().gap(pt(4.0));
+        let actions: [(&str, fn(&mut figcraft_color::Gradient, usize)); 3] = [
+            ("Remove stop", |g, sel| {
+                if g.stops.len() > 2 {
+                    g.stops.remove(sel.min(g.stops.len() - 1));
+                }
+            }),
+            ("Flip", |g, _| {
+                for s in &mut g.stops {
+                    s.position = 1.0 - s.position;
+                }
+            }),
+            ("Rotate 90°", |g, _| {
+                let (fx, fy) = g.from;
+                let rot = |(x, y): (f64, f64)| (fx - (y - fy), fy + (x - fx));
+                g.to = rot(g.to);
+                g.width = rot(g.width);
+            }),
+        ];
+        for (label, action) in actions {
+            let write_b = write.clone();
+            let state_b = state.clone();
+            let sel_b = sel.clone();
+            buttons = buttons.child(
+                div()
+                    .h(pt(22.0))
+                    .px(pt(6.0))
+                    .rounded(pt(3.0))
+                    .border_1()
+                    .border_color(rgba(t.border))
+                    .text_size(pt(10.0))
+                    .text_color(rgba(t.text))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        let mut np = state_b.borrow().clone();
+                        if let figcraft_color::PaintKind::Gradient(gg) = &mut np.kind {
+                            action(gg, sel_b.get());
+                        }
+                        write_b(np, window, cx);
+                    }),
+            );
+        }
+
+        div().w(pt(240.0)).flex().flex_col().gap(pt(4.0)).child(ramp).child(stops).child(buttons)
     }
 
     fn list_element(&self, cx: &mut App) -> AnyElement {
@@ -1482,6 +3100,11 @@ impl WindowState {
         // TypeSettings 的 pad 少 4，这里补回左右各 4 的视觉内边距。
         let mut col = if self.kind == WindowKind::TypeSettings {
             crate::widgets::popover::popover_body().px(pt(4.0))
+        } else if self.kind == WindowKind::StyleEditor {
+            // lizard 4 个样式编辑器用 `ui.spacing_mut().item_spacing.y = 0`，各段之间是精确的
+            // add_space(16/8/24/8/10/20)，属性行之间更是 0 间距。通用 popover_body 的 8pt gap
+            // 会和每行自带的 margin 叠加，必须换成 gap=0 的容器，由 `Setting::Spacer` 逐段控制。
+            div().w_full().flex().flex_col()
         } else {
             crate::widgets::popover::popover_body()
         };
@@ -1515,7 +3138,7 @@ impl WindowState {
         let tab = self.tabs.as_ref().map(|(_, a)| *a.borrow()).unwrap_or(0);
         let list = self.settings.borrow();
         for setting in list.iter() {
-            if let Some(el) = self.render_setting(setting, tab) {
+            if let Some(el) = self.render_setting(cx, setting, tab) {
                 col = col.child(el);
             }
         }
@@ -1531,10 +3154,17 @@ impl WindowState {
     }
 
     /// 渲染设置窗口的一行；`ExpandedRows` 会递归调用它画被 `>` 展开的子行。
-    fn render_setting(&self, setting: &Setting, tab: u8) -> Option<AnyElement> {
+    fn render_setting(&self, cx: &mut App, setting: &Setting, tab: u8) -> Option<AnyElement> {
         let t = tokens();
         let type_ui = self.kind == WindowKind::TypeSettings;
         match setting {
+            Setting::Spacer { tab: st, h } => {
+                if *st != tab {
+                    return None;
+                }
+                // 精确留白（lizard `ui.add_space(x)`）：gap=0 容器里唯一的行距来源。
+                Some(div().w_full().h(pt(*h)).flex_none().into_any_element())
+            }
             Setting::Caption { tab: st, text } => {
                 if *st != tab {
                     return None;
@@ -1580,6 +3210,219 @@ impl WindowState {
                         .text_size(pt(11.0))
                         .text_color(rgba(t.text_secondary))
                         .child(text.clone())
+                        .into_any_element(),
+                )
+            }
+            Setting::Swatch { tab: st, label, paint, index } => {
+                if *st != tab {
+                    return None;
+                }
+                // lizard `property_row`：行高 `ROW_H = 32`，色板 14×14 居中在 `x + 12`，
+                // 文字从 `x + 26` 起、11 pt。
+                let mut row = div()
+                    .w_full()
+                    .h(pt(32.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(pt(24.0))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .size(pt(14.0))
+                                    .rounded(pt(3.0))
+                                    .overflow_hidden()
+                                    .child(crate::widgets::swatch::swatch(paint.clone(), 14.0)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .pl(pt(2.0))
+                            .text_size(pt(11.0))
+                            .text_color(rgba(t.text))
+                            .child(label.clone()),
+                    );
+                // 属性行点开取色器（egui `Act::EditPaint` → `open_picker(Style { id, index })`），
+                // 写回走 `style.update {value: paints}`（整组 paints，顺序不变）。
+                if let Some(idx) = *index
+                    && let Some(edit) = self.style_edit.as_ref()
+                {
+                    let popups = edit.popups.clone();
+                    let cmds = self.cmds.clone();
+                    let sid = edit.id.clone();
+                    let all = edit.paints.clone();
+                    let current = paint.solid_color().map(crate::widgets::swatch::color32).unwrap_or(crate::canvas::geom::Color32::BLACK);
+                    row = row.hover(|s| s.bg(rgba(t.hover))).cursor_pointer().on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _w, cx: &mut App| {
+                        let write = {
+                            let cmds = cmds.clone();
+                            let sid = sid.clone();
+                            let all = all.clone();
+                            move |np: figcraft_color::Paint, _w: &mut Window, _cx: &mut App| {
+                                let mut ps = all.clone();
+                                if let Some(slot) = ps.get_mut(idx) {
+                                    *slot = np;
+                                }
+                                cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": ps })) });
+                            }
+                        };
+                        let picker = PaintPicker { paint: all[idx].clone(), on_write: Rc::new(write) };
+                        let on_pick: Rc<dyn Fn(crate::canvas::geom::Color32, &mut Window, &mut App)> = Rc::new(|_, _, _| {});
+                        popups.request(Self::color(cx, e.position, current, Some(picker), on_pick, cmds.clone()));
+                    });
+                }
+                Some(row.into_any_element())
+            }
+            Setting::PaintRow { tab: st, style_id, index, paint, hex_ed, op_ed } => {
+                if *st != tab {
+                    return None;
+                }
+                // 与右栏填充行**同一套**通用控件：`ColorField`（Input 模板：24 pt 色块 +
+                // hex + 44 pt 透明度数值 + 24 pt「%」格）跨两列，行尾是统一网格的两颗 24 pt
+                // 图标。原先这里是手写 div（16 + 16 色块 + 220 hex + 24 + 24），图标距卡片
+                // 右缘只剩 4 pt，和 effect / grid 行对不齐（用户 2026-11-15：「布局不对，
+                // 不是有封装好的控件，为什么不用呢」）。
+                let sid = style_id.clone();
+                let idx = *index;
+                let hex = paint.solid_color().map(|c| c.to_hex()).unwrap_or_default();
+                let cmds = self.cmds.clone();
+                let visible = paint.visible;
+                let eye = {
+                    let cmds = cmds.clone();
+                    let sid = sid.clone();
+                    let paints = self.style_edit.as_ref().map(|e| e.paints.clone()).unwrap_or_default();
+                    IconButton::new(if visible { Icon::Eye } else { Icon::EyeOff }).on_click(move |_, _, _| {
+                        let mut ps = paints.clone();
+                        if let Some(p) = ps.get_mut(idx) {
+                            p.visible = !visible;
+                        }
+                        cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": ps })) });
+                    })
+                };
+                let minus = {
+                    let cmds = cmds.clone();
+                    let sid = sid.clone();
+                    let paints = self.style_edit.as_ref().map(|e| e.paints.clone()).unwrap_or_default();
+                    IconButton::new(Icon::Minus).on_click(move |_, _, _| {
+                        let mut ps = paints.clone();
+                        if idx < ps.len() {
+                            ps.remove(idx);
+                        }
+                        cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": ps })) });
+                    })
+                };
+                // 色块点击 → 取色器（`Act::EditPaint`）：写回同样走 `style.update` 的整组 paints。
+                let current = paint.solid_color().map(crate::widgets::swatch::color32).unwrap_or(crate::canvas::geom::Color32::BLACK);
+                let mut cf = crate::widgets::color_field::ColorField::new(
+                    cx,
+                    paint.clone(),
+                    crate::widgets::color_field::ColorText::Hex(SharedString::from(hex)),
+                    STYLE_ROW_FIELD_W,
+                    hex_ed.clone(),
+                    op_ed.clone(),
+                );
+                if let Some(edit) = self.style_edit.as_ref() {
+                    let slot = edit.picker.clone();
+                    let all = edit.paints.clone();
+                    let write_cmds = self.cmds.clone();
+                    let write_sid = sid.clone();
+                    let write: Rc<dyn Fn(figcraft_color::Paint, &mut Window, &mut App)> = Rc::new(move |np, _w, _cx| {
+                        let mut ps = all.clone();
+                        if let Some(slot) = ps.get_mut(idx) {
+                            *slot = np;
+                        }
+                        write_cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": write_sid, "value": ps })) });
+                    });
+                    let pick = PaintPicker { paint: paint.clone(), on_write: write };
+                    let on_pick: Rc<dyn Fn(crate::canvas::geom::Color32, &mut Window, &mut App)> = Rc::new(|_, _, _| {});
+                    let open_cmds = self.cmds.clone();
+                    cf = cf.on_swatch(move |pos: Point<Pixels>, _w, cx: &mut App| {
+                        // 往**左**让 8 pt：取色器右缘贴着面板左缘排开（`open_pos` 会把它放在
+                        // 锚点左侧），两个卡片并排而不是一开一关。
+                        let anchor = Point { x: pos.x - px(8.0), y: pos.y };
+                        let child = Self::color(cx, anchor, current, Some(pick.clone()), on_pick.clone(), open_cmds.clone());
+                        *slot.borrow_mut() = Some(Box::new(child));
+                        open_cmds.wake();
+                    });
+                }
+                Some(crate::widgets::panel_section::field_row_full_trailing(cf, vec![eye, minus]).into_any_element())
+            }
+            Setting::PaintPreview { paint } => {
+                // lizard `style_paint_preview`：304×120 区，内缩 16 后的 272×104 **整块**铺色；
+                // 底是棋盘格，颜色带 alpha 时透出来。之前用 `swatch(paint, 104.0)` 只画了
+                // 104×104 的方形，右边一大片空白——这是最明显的布局偏差。
+                let solid = paint.solid_color().map(|c| crate::widgets::swatch::color32(c.with_alpha(c.a * paint.opacity)));
+                let border = rgba(t.border);
+                Some(
+                    div()
+                        .w_full()
+                        .h(pt(120.0))
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .pt(pt(16.0))
+                        .child(
+                            div()
+                                .w(pt(272.0))
+                                .h(pt(104.0))
+                                .border_1()
+                                .border_color(border)
+                                .overflow_hidden()
+                                .child(
+                                    gpui::canvas(
+                                        |_, _, _| {},
+                                        move |bounds, _, window, _| {
+                                            crate::widgets::swatch::checker(window, bounds, 12.0);
+                                            if let Some(c) = solid {
+                                                window.paint_quad(gpui::fill(bounds, rgba(c)));
+                                            }
+                                        },
+                                    )
+                                    .size_full(),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            }
+            Setting::Multiline { tab: st, label, field, rows } => {
+                if *st != tab {
+                    return None;
+                }
+                // lizard `editor`：caption 与输入框紧贴（`item_spacing.y = 0`），
+                // 输入框高度 = `desired_rows × 24`；之后 `add_space(8.0)`。
+                Some(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .mb(pt(8.0))
+                        .child(div().w_full().text_size(pt(10.0)).text_color(rgba(t.text_secondary)).child(label.clone()))
+                        .child(div().w_full().h(pt(24.0 * rows)).child(field.clone()))
+                        .into_any_element(),
+                )
+            }
+            Setting::Field { tab: st, label, field } => {
+                if *st != tab {
+                    return None;
+                }
+                // lizard `style_metadata`（4 个样式编辑器共用）：行宽 304、行高 24；
+                // 标签在 `x + 16`（11 pt `t.text_secondary`），输入框在 `x + 112`（宽 176）。
+                // 两行之间的 add_space(8) 由 `Setting::Spacer` 给，这里不能再带 mb（否则叠加成 16）。
+                Some(
+                    div()
+                        .w_full()
+                        .h(pt(24.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(div().w(pt(112.0)).flex_none().pl(pt(16.0)).text_size(pt(11.0)).text_color(rgba(t.text_secondary)).child(label.clone()))
+                        .child(div().w(pt(176.0)).h(pt(24.0)).child(field.clone()))
                         .into_any_element(),
                 )
             }
@@ -1755,11 +3598,682 @@ impl WindowState {
                 }
                 let mut body = div().w_full().flex().flex_col().gap(pt(2.0)).pl(pt(2.0));
                 for row in rows {
-                    if let Some(el) = self.render_setting(row, tab) {
+                    if let Some(el) = self.render_setting(cx, row, tab) {
                         body = body.child(el);
                     }
                 }
                 Some(body.into_any_element())
+            }
+            // ── 本地样式 4 编辑器的新增渲染分支（对齐 lizard `style_picker`）──────────
+            // ⚠️ 这里不能再放 `_ => None` 兜底：它会排在下面所有分支之前，把预览、Spacer、
+            //    SectionTitle、属性行全部吞掉（曾导致 4 个弹窗只剩 Name/Description/Delete）。
+            Setting::TextPreview { text } => {
+                // lizard `text_style_editor`：304×120 灰底，渲染 "Rag 123" 采样字（按 `font_size` 缩放）。
+                let size = Self::json_num(text, &["fontSize", "font_size"]).unwrap_or(24.0).clamp(6.0, 60.0);
+                Some(
+                    div()
+                        .w_full()
+                        .h(pt(120.0))
+                        .bg(rgba(t.hover))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(pt(size as f32))
+                        .text_color(rgba(t.text))
+                        .child(SharedString::from("Rag 123"))
+                        .into_any_element(),
+                )
+            }
+            Setting::EffectPreview { effects } => {
+                // 预览区 304×152，居中一个 **120×120 白色圆、50% 不透明度** 的样本，
+                // 并按 `effects` 里实际启用（`visible != false`）的效果逐条渲染：
+                // Drop shadow / Inner shadow / Layer blur / Background blur / Noise。
+                // 真机渲染是 GPU 材质（`apply_wgsl_materials`），这里没有离屏缓冲，所以
+                // 模糊用「多层同心圆 / 同心环 + 每层 1/N 不透明度」近似，叠加后得到从中心
+                // 到边缘逐渐衰减的软边；与画布 `painter::paint_circle` 同一图元（正方 +
+                // 四角半径 = r 的 `paint_quad`，贝塞尔圆在 0.2.1 会画成一坨）。
+                let list = effects.clone();
+                Some(
+                    div()
+                        .w_full()
+                        .h(pt(152.0))
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            gpui::canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    crate::widgets::swatch::checker(window, bounds, 8.0);
+                                    let x0 = f32::from(bounds.origin.x);
+                                    let y0 = f32::from(bounds.origin.y);
+                                    let w = f32::from(bounds.size.width);
+                                    let h = f32::from(bounds.size.height);
+                                    let cx = x0 + w / 2.0;
+                                    let cy = y0 + h / 2.0;
+                                    // 样本圆 Ø120（预览区 152 高，上下各留 16 给效果扩散）。
+                                    let r = 60.0_f32;
+                                    // 圆填充。
+                                    let disc = |window: &mut Window, ccx: f32, ccy: f32, rr: f32, c: Color32| {
+                                        if rr <= 0.0 || c.0[3] == 0 {
+                                            return;
+                                        }
+                                        let rect = Bounds { origin: point(px(ccx - rr), px(ccy - rr)), size: size(px(rr * 2.0), px(rr * 2.0)) };
+                                        let quad = gpui::fill(rect, rgba(c)).corner_radii(Corners {
+                                            top_left: px(rr),
+                                            top_right: px(rr),
+                                            bottom_right: px(rr),
+                                            bottom_left: px(rr),
+                                        });
+                                        window.paint_quad(quad);
+                                    };
+                                    // 环形描边（闭合折线，lyon 会补 join，不会碎成弧块）。
+                                    let ring = |window: &mut Window, ccx: f32, ccy: f32, rr: f32, width: f32, c: Color32| {
+                                        if rr <= 0.0 || width <= 0.0 || c.0[3] == 0 {
+                                            return;
+                                        }
+                                        let segments = ((rr * 2.5) as usize).clamp(16, 96);
+                                        let mut b = PathBuilder::stroke(px(width));
+                                        for i in 0..segments {
+                                            let t = i as f32 / segments as f32 * std::f32::consts::TAU;
+                                            let p = point(px(ccx + rr * t.cos()), px(ccy + rr * t.sin()));
+                                            if i == 0 {
+                                                b.move_to(p);
+                                            } else {
+                                                b.line_to(p);
+                                            }
+                                        }
+                                        b.close();
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, rgba(c));
+                                        }
+                                    };
+                                    let is = |e: &Value, k: &str| e.get("type").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case(k));
+                                    let fnum = |e: &Value, k: &str, d: f32| e.get(k).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(d);
+                                    // `Shadow::color` 是 `Color{r,g,b,a}`（0..1），UI 改写后可能是
+                                    // `#RRGGBB[AA]` 字符串，两种都认。
+                                    let ecolor = |e: &Value, d: Color32| -> Color32 {
+                                        let Some(v) = e.get("color") else { return d };
+                                        if let Some(s) = v.as_str() {
+                                            return Color32::from_hex(s).unwrap_or(d);
+                                        }
+                                        let f = |k: &str, dv: f32| v.get(k).and_then(Value::as_f64).map(|x| x as f32).unwrap_or(dv);
+                                        if v.is_object() {
+                                            let a = f("a", 1.0);
+                                            return Color32::from_rgba_unmultiplied(
+                                                (f("r", 0.0) * 255.0).clamp(0.0, 255.0) as u8,
+                                                (f("g", 0.0) * 255.0).clamp(0.0, 255.0) as u8,
+                                                (f("b", 0.0) * 255.0).clamp(0.0, 255.0) as u8,
+                                                (a * 255.0).clamp(0.0, 255.0) as u8,
+                                            );
+                                        }
+                                        d
+                                    };
+                                    let offset_of = |e: &Value| -> (f32, f32) {
+                                        match e.get("offset").and_then(Value::as_array) {
+                                            Some(a) => (
+                                                a.first().and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                                                a.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                                            ),
+                                            None => (0.0, 0.0),
+                                        }
+                                    };
+                                    let vis: Vec<&Value> = list
+                                        .as_array()
+                                        .map(|a| a.iter().filter(|e| e.get("visible").and_then(Value::as_bool).unwrap_or(true)).collect())
+                                        .unwrap_or_default();
+
+                                    // ① 投影：偏移 + spread 后按 blur 半径多层外扩，边缘自然衰减。
+                                    for e in &vis {
+                                        if !is(e, "dropShadow") {
+                                            continue;
+                                        }
+                                        let (ox, oy) = offset_of(e);
+                                        let blur = fnum(e, "radius", 4.0).max(0.0);
+                                        let core = (r + fnum(e, "spread", 0.0)).max(1.0);
+                                        let c = ecolor(e, Color32::from_rgba_unmultiplied(0, 0, 0, 64));
+                                        let steps = 14usize;
+                                        for i in (0..steps).rev() {
+                                            let t = (i as f32 + 1.0) / steps as f32;
+                                            let rr = core + blur * t;
+                                            // 每层 1/steps 的不透明度：中心被 14 层叠满后 ≈ 效果色本身
+                                            // 的 alpha（不能再乘系数，否则半透明样本圆会被糊成实心灰）。
+                                            let a = (c.0[3] as f32 / steps as f32).clamp(1.0, 255.0) as u8;
+                                            disc(window, cx + ox, cy + oy, rr, Color32::from_rgba_unmultiplied(c.0[0], c.0[1], c.0[2], a));
+                                        }
+                                    }
+
+                                    // ② 样本圆：白 50%；叠了 layer blur 就用多层柔化圆代替硬边。
+                                    let layer_blur = vis
+                                        .iter()
+                                        .filter(|e| is(e, "layerBlur"))
+                                        .map(|e| fnum(e, "radius", 4.0).max(0.0))
+                                        .fold(0.0_f32, f32::max);
+                                    if layer_blur > 0.5 {
+                                        let steps = 16usize;
+                                        let a = (128.0 / steps as f32 * 1.25).clamp(1.0, 255.0) as u8;
+                                        for i in (0..steps).rev() {
+                                            let t = (i as f32 + 1.0) / steps as f32;
+                                            let rr = r + layer_blur * t * 0.85;
+                                            disc(window, cx, cy, rr, Color32::from_rgba_unmultiplied(255, 255, 255, a));
+                                        }
+                                    } else {
+                                        disc(window, cx, cy, r, Color32::from_rgba_unmultiplied(255, 255, 255, 128));
+                                    }
+
+                                    // ③ 背景模糊：真实是把圆背后的内容虚化，这里用圆内一层淡白雾示意。
+                                    let bg_blur = vis
+                                        .iter()
+                                        .filter(|e| is(e, "backgroundBlur"))
+                                        .map(|e| fnum(e, "radius", 4.0).max(0.0))
+                                        .fold(0.0_f32, f32::max);
+                                    if bg_blur > 0.5 {
+                                        let a = (bg_blur * 2.2).clamp(6.0, 92.0) as u8;
+                                        disc(window, cx, cy, r, Color32::from_rgba_unmultiplied(255, 255, 255, a));
+                                    }
+
+                                    // ④ 内阴影：圆内缘画一圈由外向内衰减的暗环（按 offset 轻微偏移）。
+                                    for e in &vis {
+                                        if !is(e, "innerShadow") {
+                                            continue;
+                                        }
+                                        let blur = fnum(e, "radius", 4.0).clamp(1.0, r);
+                                        let (ox, oy) = offset_of(e);
+                                        let c = ecolor(e, Color32::from_rgba_unmultiplied(0, 0, 0, 64));
+                                        let steps = 16usize;
+                                        let step = blur / steps as f32;
+                                        for i in 0..steps {
+                                            let t = i as f32 / steps as f32;
+                                            let rr = r - step * (i as f32 + 0.5);
+                                            if rr <= 0.5 {
+                                                break;
+                                            }
+                                            let a = (c.0[3] as f32 * (1.0 - t * 0.85) / 2.6).clamp(0.0, 255.0) as u8;
+                                            ring(
+                                                window,
+                                                cx + ox * 0.35,
+                                                cy + oy * 0.35,
+                                                rr,
+                                                step + 0.7,
+                                                Color32::from_rgba_unmultiplied(c.0[0], c.0[1], c.0[2], a),
+                                            );
+                                        }
+                                    }
+
+                                    // ⑤ 噪点：圆内按 density 撒颗粒，尺寸取 `size`，颜色取效果色。
+                                    for e in &vis {
+                                        if !is(e, "noise") {
+                                            continue;
+                                        }
+                                        let grain = fnum(e, "size", 0.5).clamp(0.6, 8.0);
+                                        let density = fnum(e, "density", 0.5).clamp(0.0, 1.0);
+                                        let c = ecolor(e, Color32::from_rgba_unmultiplied(0, 0, 0, 64));
+                                        let count = (density * 900.0) as usize;
+                                        let mut seed: u32 = 0x1234_5678;
+                                        for _ in 0..count {
+                                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                                            let ux = ((seed >> 8) & 0xFFFF) as f32 / 65535.0;
+                                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                                            let uy = ((seed >> 8) & 0xFFFF) as f32 / 65535.0;
+                                            let gx = cx + (ux * 2.0 - 1.0) * r;
+                                            let gy = cy + (uy * 2.0 - 1.0) * r;
+                                            if (gx - cx).powi(2) + (gy - cy).powi(2) > r * r {
+                                                continue;
+                                            }
+                                            window.paint_quad(gpui::fill(
+                                                Bounds { origin: point(px(gx), px(gy)), size: size(px(grain), px(grain)) },
+                                                rgba(c),
+                                            ));
+                                        }
+                                    }
+                                },
+                            )
+                            .size_full(),
+                        )
+                        .into_any_element(),
+                )
+            }
+            Setting::GridPreview { grids } => {
+                // 图标按 Figma 导出的 6 个 SVG（`Frame 204`–`209`）1:1 绘制：
+                //   204 / 205 / 206 = 46×46（2 pt 黑框）+ 内部 9 点阵 / 三竖条 / 三横条；
+                //   207 / 208 / 209 = 同一块放在 50×50 里，**再多画右下角那条 L 形折线** ——
+                //   即「这个样式里有多条网格」的标记。所以「有多个才带折线」是直接读设计稿的。
+                let list = grids.as_array().cloned().unwrap_or_default();
+                let first = list.iter().find(|g| g.get("visible").and_then(|v| v.as_bool()).unwrap_or(true)).or_else(|| list.first());
+                let kind = first.and_then(|g| g.get("kind")).and_then(|k| k.as_str()).unwrap_or("grid").to_string();
+                let multi = list.len() > 1;
+                Some(
+                    div()
+                        .w_full()
+                        .h(pt(152.0))
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            gpui::canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    crate::widgets::swatch::checker(window, bounds, 8.0);
+                                    let x0 = f32::from(bounds.origin.x);
+                                    let y0 = f32::from(bounds.origin.y);
+                                    let w = f32::from(bounds.size.width);
+                                    let h = f32::from(bounds.size.height);
+                                    // 单条：46×46 的图标本身；多条：50×50 的框（多出来的是那条折线）。
+                                    let side = if multi { 50.0 } else { 46.0 };
+                                    let left = x0 + (w - side) / 2.0;
+                                    let top = y0 + (h - side) / 2.0;
+                                    let p = |x: f32, y: f32| point(px(x), px(y));
+                                    let sz = |v: f32, hv: f32| size(px(v), px(hv));
+                                    let black = rgba(crate::canvas::geom::Color32::BLACK);
+                                    let white = rgba(crate::canvas::geom::Color32::WHITE);
+                                    // 46×46 黑框（stroke-width 2 居中在 x=1/y=1 → 边框占 0..2）+ 白底。
+                                    window.paint_quad(gpui::fill(gpui::Bounds { origin: p(left, top), size: sz(46.0, 46.0) }, black));
+                                    window.paint_quad(gpui::fill(gpui::Bounds { origin: p(left + 2.0, top + 2.0), size: sz(42.0, 42.0) }, white));
+                                    // 内部图形：点阵 6×6 每格 12；竖条 6×30；横条 30×6（均从 8 起）。
+                                    match kind.as_str() {
+                                        "columns" => {
+                                            for i in 0..3 {
+                                                let bx = left + 8.0 + 12.0 * i as f32;
+                                                window.paint_quad(gpui::fill(gpui::Bounds { origin: p(bx, top + 8.0), size: sz(6.0, 30.0) }, black));
+                                            }
+                                        }
+                                        "rows" => {
+                                            for i in 0..3 {
+                                                let by = top + 8.0 + 12.0 * i as f32;
+                                                window.paint_quad(gpui::fill(gpui::Bounds { origin: p(left + 8.0, by), size: sz(30.0, 6.0) }, black));
+                                            }
+                                        }
+                                        _ => {
+                                            for r in 0..3 {
+                                                for c in 0..3 {
+                                                    let bx = left + 8.0 + 12.0 * c as f32;
+                                                    let by = top + 8.0 + 12.0 * r as f32;
+                                                    window.paint_quad(gpui::fill(gpui::Bounds { origin: p(bx, by), size: sz(6.0, 6.0) }, black));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // 多条：右下折线（`M50 50H4V48H48V4H50V50Z` → 底部 4..50 与右侧 4..50
+                                    // 各一条 2 pt 的带），与主块之间留 2 pt 缝 —— 像后面还压着一层。
+                                    if multi {
+                                        window.paint_quad(gpui::fill(gpui::Bounds { origin: p(left + 4.0, top + 48.0), size: sz(46.0, 2.0) }, black));
+                                        window.paint_quad(gpui::fill(gpui::Bounds { origin: p(left + 48.0, top + 4.0), size: sz(2.0, 46.0) }, black));
+                                    }
+                                },
+                            )
+                            .size_full(),
+                        )
+                        .into_any_element(),
+                )
+            }
+            Setting::SectionTitle { tab: st, text, h, style_id, array, menu, anchor } => {
+                if *st != tab {
+                    return None;
+                }
+                // lizard：Properties 标题（x+16、semibold 11pt）与「+」按钮在**同一行** 304×32；
+                // 「Add fill」等只是按钮 tooltip，不是可见文字。
+                let mut row = div()
+                    .w_full()
+                    .h(pt(*h))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .pl(pt(16.0))
+                            .text_size(pt(11.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgba(t.text))
+                            .child(text.clone()),
+                    )
+                    .child(div().flex_1().min_w(px(0.0)));
+                if !menu.is_empty() {
+                    let write: Rc<dyn Fn(Value)> = {
+                        let cmds = self.cmds.clone();
+                        let sid = style_id.clone();
+                        let arr = array.clone();
+                        Rc::new(move |item: Value| {
+                            let mut a = arr.clone();
+                            if let Value::Array(items) = &mut a {
+                                items.push(item);
+                            } else {
+                                a = Value::Array(vec![item]);
+                            }
+                            cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": a })) });
+                        })
+                    };
+                    let single = menu.len() <= 1;
+                    let push_direct = write.clone();
+                    let direct_item = menu.first().map(|(_, v)| v.clone()).unwrap_or(Value::Null);
+                    let open_anchor = anchor.clone();
+                    let wake = self.cmds.clone();
+                    let on_add = move |e: &MouseDownEvent, _w: &mut Window, _cx: &mut App| {
+                        if single {
+                            push_direct(direct_item.clone());
+                        } else {
+                            *open_anchor.borrow_mut() = Some(Bounds { origin: e.position, size: size(px(24.0), px(24.0)) });
+                            wake.wake();
+                        }
+                    };
+                    if let Some(rect) = *anchor.borrow() {
+                        let rows: Vec<MenuRow> = menu.iter().map(|(l, _)| MenuRow::new(l.clone())).collect();
+                        let items = menu.clone();
+                        let w = write.clone();
+                        let at2 = anchor.clone();
+                        let wake2 = self.cmds.clone();
+                        let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new(move |picked: &str, _win, _cx| {
+                            if let Some((_, v)) = items.iter().find(|(l, _)| *l == picked) {
+                                w(v.clone());
+                            }
+                            *at2.borrow_mut() = None;
+                            wake2.wake();
+                        });
+                        let at3 = anchor.clone();
+                        let wake3 = self.cmds.clone();
+                        let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_win, _cx| {
+                            *at3.borrow_mut() = None;
+                            wake3.wake();
+                        });
+                        let m = menu_popup_in(rect, None, rows, on_pick, dismiss, f32::from(self.viewport.width), f32::from(self.viewport.height));
+                        self.overlays.borrow_mut().push(m);
+                    }
+                    row = row.child(
+                        div()
+                            .size(pt(24.0))
+                            .mr(pt(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(crate::widgets::icon::paint(Icon::Plus, rgba(t.text_secondary), 14.0))
+                            .on_mouse_down(MouseButton::Left, on_add),
+                    );
+                }
+                Some(row.into_any_element())
+            }
+            Setting::TextControls {
+                tab: st, family, families, font_style, font_styles,
+                size_field, line_field, spacing_field,
+                style_id, text, family_anchor, style_anchor,
+            } => {
+                if *st != tab {
+                    return None;
+                }
+                // lizard `text_style_editor` 的 `ui.scope(item_spacing = (8,8))`：每行先
+                // add_space(16)，行距 8；三行分别是 248 / 120+120 / 120+120+Dots。
+                // 「>」/Dots 打开的 Type settings 面板 Monet 还没搬，这里只留 24 宽的占位。
+                let make_select = |key: &str,
+                                   current: &Rc<RefCell<SharedString>>,
+                                   width: f32,
+                                   fld: &'static str,
+                                   options: &[SharedString],
+                                   anchor: &Rc<RefCell<Option<Bounds<Pixels>>>>|
+                 -> AnyElement {
+                    let cur = current.borrow().clone();
+                    let at = anchor.clone();
+                    let wake = self.cmds.clone();
+                    let trigger = dropdown(cur, width, None).menu(key.to_string()).on_click(move |rect, _w, _cx| {
+                        *at.borrow_mut() = Some(rect);
+                        wake.wake();
+                    });
+                    if let Some(rect) = *anchor.borrow() {
+                        let rows: Vec<MenuRow> = options
+                            .iter()
+                            .map(|o| MenuRow::new(o.clone()).checked(Some(*o == *current.borrow())))
+                            .collect();
+                        let sid = style_id.clone();
+                        let ts = text.clone();
+                        let cmds = self.cmds.clone();
+                        let cur_state = current.clone();
+                        let at2 = anchor.clone();
+                        let wake2 = self.cmds.clone();
+                        let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new(move |picked: &str, _win, _cx| {
+                            let updated = {
+                                let mut v = ts.borrow_mut();
+                                v[fld] = json!(picked);
+                                v.clone()
+                            };
+                            cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": updated })) });
+                            *cur_state.borrow_mut() = SharedString::from(picked.to_string());
+                            *at2.borrow_mut() = None;
+                            wake2.wake();
+                        });
+                        let at3 = anchor.clone();
+                        let wake3 = self.cmds.clone();
+                        let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_win, _cx| {
+                            *at3.borrow_mut() = None;
+                            wake3.wake();
+                        });
+                        let m = menu_popup_in(rect, None, rows, on_pick, dismiss, f32::from(self.viewport.width), f32::from(self.viewport.height));
+                        self.overlays.borrow_mut().push(m);
+                    }
+                    trigger.into_any_element()
+                };
+                let family_select = make_select("style-family", family, 248.0, "font_family", families, family_anchor);
+                let style_select = make_select("style-weight", font_style, 120.0, "font_style", font_styles, style_anchor);
+                // 数字框必须在 120 宽的 flex_none 容器里：直接作为 flex_row 子项会被交叉轴/剩余
+                // 空间拉宽，第二行「字号」会一路撑到卡片右边（lizard 是固定 ControlWidth::Fixed(120)）。
+                let fixed = |w: f32, el: AnyElement| div().w(pt(w)).h(pt(24.0)).flex_none().child(el).into_any_element();
+                let row = |el: AnyElement| div().w_full().h(pt(24.0)).flex().flex_row().items_center().pl(pt(16.0)).gap(pt(8.0)).child(el).into_any_element();
+                let mut r2 = div().w_full().h(pt(24.0)).flex().flex_row().items_center().pl(pt(16.0)).gap(pt(8.0)).child(style_select);
+                r2 = r2.child(fixed(120.0, size_field.clone().into_any_element()));
+                let mut r3 = div().w_full().h(pt(24.0)).flex().flex_row().items_center().pl(pt(16.0)).gap(pt(8.0))
+                    .child(fixed(120.0, line_field.clone().into_any_element()))
+                    .child(fixed(120.0, spacing_field.clone().into_any_element()));
+                // 行尾 Dots：打开 Type settings —— 和「选中文本节点」的同一个面板，只是写入
+                // 目标换成本样式（`style.update`）。它作为**本卡片的子浮层**排在左侧，不占
+                // root 的 `popup` 单槽，所以点开它不会把样式面板本身关掉。
+                let open_type = {
+                    let slot = self.style_edit.as_ref().map(|e| e.picker.clone());
+                    let queue = self.cmds.clone();
+                    let wake = self.cmds.clone();
+                    let sid = style_id.clone();
+                    let ts = text.clone();
+                    move |y: Pixels, cx: &mut App| {
+                        let Some(slot) = slot.clone() else { return };
+                        let data = style_text_data(&ts.borrow());
+                        let child = Self::type_settings(style_write_queue(&queue, sid.clone(), ts.clone()), &data, cx, point(px(0.0), y));
+                        *slot.borrow_mut() = Some(Box::new(child));
+                        wake.wake();
+                    }
+                };
+                r3 = r3.child(
+                    div()
+                        .size(pt(24.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _w, cx| open_type(e.position.y, cx))
+                        .child(crate::widgets::icon::paint(Icon::Menu, rgba(t.text_secondary), 14.0)),
+                );
+                Some(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(pt(8.0))
+                        .child(row(family_select))
+                        .child(r2.into_any_element())
+                        .child(r3.into_any_element())
+                        .into_any_element(),
+                )
+            }
+            Setting::EffectRow { tab: st, style_id, index, label, ty: _, visible, effect: _, array, anchor } => {
+                if *st != tab {
+                    return None;
+                }
+                // 右栏效果行的**同一套**：统一网格（`field_row_full_trailing`，左 16 / 右 8 内缩）
+                // + `Dropdown::fill()`（带 chevron 的那颗字段按钮）+ 两颗 `IconButton`。
+                // 原先这里手写 `div().flex_row()`、标签是裸文字、图标顶到卡片右缘，和右栏同一行
+                // 长得完全不一样（用户 2026-11-15：「布局不对，而且没有复用已有组件」）。
+                let sid = style_id.clone();
+                let idx = *index;
+                let vis = *visible;
+                let arr = array.clone();
+                let cmds = self.cmds.clone();
+                let eye = {
+                    let arr = arr.clone();
+                    let cmds = cmds.clone();
+                    let sid = sid.clone();
+                    IconButton::new(if vis { Icon::Eye } else { Icon::EyeOff }).on_click(move |_, _, _| {
+                        let mut a = arr.clone();
+                        if let Value::Array(items) = &mut a
+                            && let Some(e) = items.get_mut(idx)
+                        {
+                            e["visible"] = json!(!vis);
+                        }
+                        cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": a })) });
+                    })
+                };
+                let minus = {
+                    let arr = arr.clone();
+                    let cmds = cmds.clone();
+                    let sid = sid.clone();
+                    IconButton::new(Icon::Minus).on_click(move |_, _, _| {
+                        let mut a = arr.clone();
+                        if let Value::Array(items) = &mut a
+                            && idx < items.len()
+                        {
+                            items.remove(idx);
+                        }
+                        cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": a })) });
+                    })
+                };
+                // 类型下拉：菜单与「+」同源（`Effect::TYPES`），选中就把这一条换成该类型的新对象，
+                // `visible` 保持不变。点开与收起都走 `overlays`（浮层内菜单的唯一通道）。
+                let at = anchor.clone();
+                let wake = cmds.clone();
+                let dd = dropdown(label.clone(), STYLE_ROW_FIELD_W, None).fill().on_click(move |rect, _w, _cx| {
+                    *at.borrow_mut() = Some(rect);
+                    wake.wake();
+                });
+                if let Some(rect) = *anchor.borrow() {
+                    let rows: Vec<MenuRow> = figcraft_doc::Effect::TYPES
+                        .iter()
+                        .map(|(l, _)| MenuRow::new(tr(l)).checked(Some(tr(l) == label.as_ref())))
+                        .collect();
+                    let arr2 = arr.clone();
+                    let cmds2 = cmds.clone();
+                    let sid2 = sid.clone();
+                    let at2 = anchor.clone();
+                    let wake2 = cmds.clone();
+                    let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new(move |picked: &str, _w, _cx| {
+                        if let Some((_, kind)) = figcraft_doc::Effect::TYPES.iter().find(|(l, _)| tr(l) == picked)
+                            && let Some(mut e) = figcraft_doc::Effect::of_type(kind)
+                        {
+                            e.visible = vis;
+                            let mut a = arr2.clone();
+                            if let Value::Array(items) = &mut a
+                                && let Some(slot) = items.get_mut(idx)
+                                && let Ok(v) = serde_json::to_value(e)
+                            {
+                                *slot = v;
+                            }
+                            cmds2.push(Cmd { id: "style.update", params: Some(json!({ "style": sid2, "value": a })) });
+                        }
+                        *at2.borrow_mut() = None;
+                        wake2.wake();
+                    });
+                    let at3 = anchor.clone();
+                    let wake3 = cmds.clone();
+                    let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_w, _cx| {
+                        *at3.borrow_mut() = None;
+                        wake3.wake();
+                    });
+                    let m = menu_popup_in(rect, None, rows, on_pick, dismiss, f32::from(self.viewport.width), f32::from(self.viewport.height));
+                    self.overlays.borrow_mut().push(m);
+                }
+                Some(crate::widgets::panel_section::field_row_full_trailing(dd, vec![eye, minus]).into_any_element())
+            }
+            Setting::GridRow { tab: st, style_id, index, label, visible, grids, anchor } => {
+                if *st != tab {
+                    return None;
+                }
+                // 与 `EffectRow` 同一套行（网格 + 下拉 + 眼睛 + 减号），只有下拉的菜单不同。
+                let sid = style_id.clone();
+                let idx = *index;
+                let vis = *visible;
+                let arr = grids.clone();
+                let cmds = self.cmds.clone();
+                let eye = {
+                    let arr = arr.clone();
+                    let cmds = cmds.clone();
+                    let sid = sid.clone();
+                    IconButton::new(if vis { Icon::Eye } else { Icon::EyeOff }).on_click(move |_, _, _| {
+                        let mut a = arr.clone();
+                        if let Value::Array(items) = &mut a
+                            && let Some(e) = items.get_mut(idx)
+                        {
+                            e["visible"] = json!(!vis);
+                        }
+                        cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": a })) });
+                    })
+                };
+                let minus = {
+                    let arr = arr.clone();
+                    let cmds = cmds.clone();
+                    let sid = sid.clone();
+                    IconButton::new(Icon::Minus).on_click(move |_, _, _| {
+                        let mut a = arr.clone();
+                        if let Value::Array(items) = &mut a
+                            && idx < items.len()
+                        {
+                            items.remove(idx);
+                        }
+                        cmds.push(Cmd { id: "style.update", params: Some(json!({ "style": sid, "value": a })) });
+                    })
+                };
+                // 类型下拉：Grid / Columns / Rows（与「+」菜单同源），换类型时保留 `visible` 与颜色。
+                let at = anchor.clone();
+                let wake = cmds.clone();
+                let dd = dropdown(label.clone(), STYLE_ROW_FIELD_W, None).fill().on_click(move |rect, _w, _cx| {
+                    *at.borrow_mut() = Some(rect);
+                    wake.wake();
+                });
+                if let Some(rect) = *anchor.borrow() {
+                    // 类型菜单：Grid / Columns / Rows（与「+」菜单同源）。行标签是「5 columns」
+                    // 这类带数量的描述，无法与菜单文字直接比对，所以这一栏不画勾选标记。
+                    let kinds: Vec<(&'static str, figcraft_doc::LayoutGrid)> = vec![
+                        ("Grid", figcraft_doc::LayoutGrid::default()),
+                        ("Columns", figcraft_doc::LayoutGrid::columns()),
+                        ("Rows", figcraft_doc::LayoutGrid::rows()),
+                    ];
+                    let rows: Vec<MenuRow> = kinds.iter().map(|(l, _)| MenuRow::new(tr(l))).collect();
+                    let arr2 = arr.clone();
+                    let cmds2 = cmds.clone();
+                    let sid2 = sid.clone();
+                    let at2 = anchor.clone();
+                    let wake2 = cmds.clone();
+                    let on_pick: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new(move |picked: &str, _w, _cx| {
+                        if let Some((_, proto)) = kinds.iter().find(|(l, _)| tr(l) == picked) {
+                            let mut a = arr2.clone();
+                            if let Value::Array(items) = &mut a
+                                && let Some(slot) = items.get_mut(idx)
+                            {
+                                // 换类型时保留用户调过的颜色。
+                                let color = slot.get("color").cloned();
+                                if let Ok(mut v) = serde_json::to_value(proto) {
+                                    if let (Some(c), Some(o)) = (color, v.as_object_mut()) {
+                                        o.insert("color".into(), c);
+                                    }
+                                    *slot = v;
+                                }
+                            }
+                            cmds2.push(Cmd { id: "style.update", params: Some(json!({ "style": sid2, "value": a })) });
+                        }
+                        *at2.borrow_mut() = None;
+                        wake2.wake();
+                    });
+                    let at3 = anchor.clone();
+                    let wake3 = cmds.clone();
+                    let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_w, _cx| {
+                        *at3.borrow_mut() = None;
+                        wake3.wake();
+                    });
+                    let m = menu_popup_in(rect, None, rows, on_pick, dismiss, f32::from(self.viewport.width), f32::from(self.viewport.height));
+                    self.overlays.borrow_mut().push(m);
+                }
+                Some(crate::widgets::panel_section::field_row_full_trailing(dd, vec![eye, minus]).into_any_element())
             }
         }
     }
@@ -1803,6 +4317,20 @@ impl WindowState {
         // Full 呈现：egui 的 `variables_panel::full(panel)` —— 只占「面板 + 画布」那块（左侧 rail
         // 保留），`Frame::NONE` 贴边铺满；Floating 用构造时的宽高与拖拽位置。
         let full = self.kind == WindowKind::VariablesTable && self.variables_full();
+        // 取色器的高度跟着内容走（纯色 ↔ 渐变、色板行数）。必须在读 `self.height` 之前算，
+        // 否则切换模式的当帧卡片会短一截、下一帧才补上。
+        if self.kind == WindowKind::Color {
+            self.height = self.color_card_height();
+        }
+        // 构造期的 `height` 只是估算（取色器估成 532，实际约 307）：估算偏大时 `clamp` 会把
+        // 卡片顶在上边界、怎么拖都不动。上一帧量到过真实高度就用它（变量表有自己的尺寸，
+        // 由 `editor.size()` 决定，不参与）。
+        if self.editor.is_none() {
+            let real = self.measured_h.get();
+            if real > 0.0 {
+                self.height = real;
+            }
+        }
         // 变量窗口允许用户拖 8 个 handle 改尺寸（`EditorState.size`）。
         let (base_w, base_h) = self.editor.as_ref().and_then(|e| e.size()).unwrap_or((self.width, self.height));
         // Full 从左侧 rail 的右缘开始，宽 = 视口 − rail，这样左栏图标不会消失。
@@ -1838,7 +4366,13 @@ impl WindowState {
             .title(self.title_slot())
             .body(self.body_element(cx, body_h.max(120.0), width, viewport))
             .on_drag_start(move |e, window, cx| drag(e, window, cx))
-            .on_drag_move(move |e, window, cx| drag_move(e, window, cx));
+            .on_drag_move(move |e, window, cx| drag_move(e, window, cx))
+            .on_measure({
+                let m = self.measured_h.clone();
+                move |h: Pixels| {
+                    m.set(f32::from(h));
+                }
+            });
         if let Some(p) = at {
             pop = pop.at(p);
         }
@@ -1847,6 +4381,54 @@ impl WindowState {
         // 菜单卡片与浮层卡片同挂窗口根（els），所以菜单用窗口坐标，不被浮层的滚动裁剪。
         let mut els = vec![card];
         els.extend(self.overlays.borrow_mut().drain(..));
+        // 子浮层：属性行点开的取色器（或排版设置）。它是**本窗口自己**的一层，排在卡片左侧，
+        // 不占 root 的 `popup` 单槽，所以样式面板不会被替换掉。渲染期间先把它从 `RefCell`
+        // 里取出来（`render` 要 `&mut self`），画完再放回去，保留它自己的拖动 / 状态。
+        // 先把子浮层从 `RefCell` 里**取出来**（借用当帧结束），画完再放回去：
+        // `if let ... = slot.borrow_mut().take()` 会让那笔借用活到整个 if 体里，
+        // 末尾放回时撞上 "RefCell already borrowed"。
+        let sub = self.style_edit.as_ref().map(|e| e.picker.clone()).and_then(|slot| {
+            let taken = slot.borrow_mut().take();
+            taken.map(|c| (slot, c))
+        });
+        if let Some((slot, mut child)) = sub {
+            let closer: Rc<dyn Fn(&mut Window, &mut App)> = {
+                let slot = slot.clone();
+                let wake = self.cmds.clone();
+                Rc::new(move |_w: &mut Window, _cx: &mut App| {
+                    *slot.borrow_mut() = None;
+                    wake.wake();
+                })
+            };
+            // 子浮层**自己拖自己**：按下 / 移动都写它自己的 `hold` / `place`，父卡片的 `place`
+            // 一点都不动。这里给的是元素级回调（指针还在子卡片上时生效）；指针离开子卡片后
+            // 由根视图的窗口级路由接上（`CanvasView::move_popup_drag` 先看 `sub_*`）。
+            let sub_press: Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> = {
+                let slot = slot.clone();
+                Rc::new(move |e: &MouseDownEvent, _w: &mut Window, _cx: &mut App| {
+                    // 只记状态、不唤醒：按下的那次重绘会让 down/up 的 ElementId 对不上。
+                    if let Some(c) = slot.borrow_mut().as_mut() {
+                        c.press(e.position);
+                    }
+                })
+            };
+            let sub_move: Rc<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)> = {
+                let slot = slot.clone();
+                let wake = self.cmds.clone();
+                Rc::new(move |e: &MouseMoveEvent, _w: &mut Window, _cx: &mut App| {
+                    let moved = slot.borrow_mut().as_mut().map(|c| c.move_drag(e.position)).unwrap_or(false);
+                    if moved {
+                        wake.wake();
+                    }
+                })
+            };
+            // 子浮层的锚点是**本卡片左缘再往左 8**：`anchored_open` 会把锚点当成卡片的右缘，
+            // 于是取色器整张排在样式面板左边、两张卡并排。直接传父窗口的 `right_edge` 会让它
+            // 右缘对齐同一个位置，正好压在样式面板上。
+            let child_edge = px(f32::from(self.origin.x) - 8.0);
+            els.extend(child.render(cx, viewport, closer, sub_press, sub_move, child_edge));
+            *slot.borrow_mut() = Some(child);
+        }
         els
     }
 }
@@ -2052,6 +4634,76 @@ fn anchored_open(open: Open, right_edge: Pixels) -> Open {
 /// `Hsb` → `Color32`（与 `widgets/menu.rs::hsb_color` 同式，取色器主体自己算色用）。
 fn hsb_color(h: f32, s: f32, b: f32) -> Color32 {
     crate::widgets::swatch::color32(figcraft_color::Hsb { h, s, b }.to_color())
+}
+
+/// 面板内容宽（= 240）。所有行的宽度都用它，行内再自己给 8 / 16 的内缩。
+const PANEL_W: f32 = 240.0;
+/// 色域方块边长（208 = 240 − 16×2）。
+const SPECTRUM: f32 = 208.0;
+/// 滑轨宽度（208 − 吸管 24 − gap 12）。
+const SLIDER_W: f32 = 172.0;
+/// 色块边长与节奏（16 + 8）。
+const CHIT: f32 = 16.0;
+const CHIT_PITCH: f32 = 24.0;
+/// 一行放几个色块（216 / 24）。
+const CHITS_PER_ROW: usize = 9;
+
+/// 四种渐变类型，按 Figma 分段控件的顺序排（线性 / 径向 / 角度 / 菱形）。
+const GRADIENT_KINDS: [figcraft_color::GradientKind; 4] = [
+    figcraft_color::GradientKind::Linear,
+    figcraft_color::GradientKind::Radial,
+    figcraft_color::GradientKind::Angular,
+    figcraft_color::GradientKind::Diamond,
+];
+
+/// Figma 的拾色点 / 滑块（`_1q2ok2r5/6` + `_1t0vmmd5/7`）：16 pt 白环、中间填实色，
+/// 环外一圈 1 px 半透明描边（用 18 pt 的半透明底托出 `controlknoboffoutline`）。
+/// `x`/`y` 是环心的位置（相对父容器的 `relative` 原点）。
+fn picker_knob(x: f32, y: f32, fill: Color32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(x - 9.0))
+        .top(px(y - 9.0))
+        .w(pt(18.0))
+        .h(pt(18.0))
+        .rounded_full()
+        .bg(rgba(Color32::from_black_alpha(20)))
+        .child(
+            div()
+                .absolute()
+                .left(pt(1.0))
+                .top(pt(1.0))
+                .w(pt(16.0))
+                .h(pt(16.0))
+                .rounded_full()
+                .border(pt(4.0))
+                .border_color(rgba(Color32::WHITE))
+                .bg(rgba(fill)),
+        )
+}
+
+/// 记录元素矩形（弹窗菜单锚点用）的透明探针：prepaint 存盒子，绘制阶段什么都不画。
+fn bounds_probe(hit: Rc<Cell<Option<Bounds<Pixels>>>>) -> gpui::Div {
+    div().absolute().left_0().top_0().w_full().h_full().child(gpui::canvas(
+        move |bounds, _, _| hit.set(Some(bounds)),
+        |_, _, _, _| {},
+    ))
+}
+
+/// WCAG 相对亮度（sRGB，按 0.2126 / 0.7152 / 0.0722 加权）。
+fn relative_luminance(c: Color32) -> f32 {
+    let ch = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * ch(c.0[0]) + 0.7152 * ch(c.0[1]) + 0.0722 * ch(c.0[2])
+}
+
+/// 两个不透明色的对比度（1.0 … 21.0）。
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 #[cfg(test)]

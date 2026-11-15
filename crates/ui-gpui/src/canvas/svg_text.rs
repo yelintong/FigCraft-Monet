@@ -33,12 +33,17 @@ impl AssetSource for AppAssets {
         if let Some(name) = path.strip_prefix(crate::widgets::typ_icons::ASSET_PREFIX).and_then(|s| s.strip_suffix(".svg")) {
             return Ok(crate::widgets::typ_icons::TypIcon::load(name).map(|s| Cow::Borrowed(s.as_bytes())));
         }
+        // 取色器四条工具栏的 24 pt 图标（Figma DOM 原始 SVG，见 `crate::picker_icons`）。
+        if let Some(name) = path.strip_prefix(crate::picker_icons::ASSET_PREFIX).and_then(|s| s.strip_suffix(".svg")) {
+            return Ok(crate::picker_icons::PickerIcon::load(name).map(|s| Cow::Borrowed(s.as_bytes())));
+        }
         crate::widgets::icon::IconAssets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut all: Vec<SharedString> = crate::widgets::icon::IconAssets.list(path)?;
         all.extend(crate::widgets::typ_icons::TypIcon::list());
+        all.extend(crate::picker_icons::PickerIcon::list());
         Ok(all)
     }
 }

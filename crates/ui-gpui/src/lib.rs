@@ -124,6 +124,9 @@ mod layer_tree;
 /// 五个旧弹窗（自动布局 / 描边 / 取色器 / 变量 / 文本样式）在通用窗口上的装配层。
 mod popovers;
 
+/// 取色器专用的 24 pt 图标（Figma DOM 原始 SVG，走 `picker:` 资源前缀）。
+mod picker_icons;
+
 /// Prototype 演示层（proto.present / proto.preview 的动画播放）。
 mod present;
 
@@ -779,9 +782,9 @@ impl CanvasView {
 
             control_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
 
-            left_w: panels::DEFAULT_PANEL,
+            left_w: panels::DEFAULT_LEFT_PANEL,
 
-            right_w: panels::DEFAULT_PANEL,
+            right_w: panels::DEFAULT_RIGHT_PANEL,
 
             resizing: None,
 
@@ -974,7 +977,7 @@ impl CanvasView {
                 "color" => {
                     let on_pick = Rc::new(|_c: Color32, _w: &mut Window, _cx: &mut App| {});
 
-                    Some(popovers::WindowState::color(cx, anchor, Color32::from_rgb(0x2D, 0x9C, 0xDB), on_pick, view.fields.queue()))
+                    Some(popovers::WindowState::color(cx, anchor, Color32::from_rgb(0x2D, 0x9C, 0xDB), None, on_pick, view.fields.queue()))
                 }
 
                 _ => None,
@@ -1594,11 +1597,9 @@ impl CanvasView {
                 panels::extra::UiAction::Widths { left, right } => {
                     let reset = left.is_none() && right.is_none();
 
-                    let default = panels::DEFAULT_PANEL;
+                    self.left_w = left.unwrap_or(if reset { panels::DEFAULT_LEFT_PANEL } else { self.left_w });
 
-                    self.left_w = left.unwrap_or(if reset { default } else { self.left_w });
-
-                    self.right_w = right.unwrap_or(if reset { default } else { self.right_w });
+                    self.right_w = right.unwrap_or(if reset { panels::DEFAULT_RIGHT_PANEL } else { self.right_w });
                 }
 
                 panels::extra::UiAction::Palette => {
@@ -1960,6 +1961,18 @@ impl CanvasView {
         // the moment a button is clicked, which in a retained tree is the frame after.
 
         let cmds = self.fields.take_cmds();
+        // 收集本次样式命令涉及到的 style id，命令回写文档后据此刷新打开中的样式编辑器。
+        let style_targets: Vec<String> = cmds
+            .iter()
+            .filter(|c| c.id.starts_with("style."))
+            .filter_map(|c| {
+                c.params
+                    .as_ref()
+                    .and_then(|p| p.get("style"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
 
         if !cmds.is_empty() {
             let ids = self.app.session.ds().ok().map(|d| d.selection.clone()).unwrap_or_default();
@@ -1995,6 +2008,25 @@ impl CanvasView {
             // document, so ask for the frame that redraws them.
 
             cx.notify();
+        }
+
+        // 样式命令回写文档后，刷新打开中的同款样式编辑器正文（被删则关闭），否则点了按钮界面不变。
+        if !style_targets.is_empty() {
+            let mut deleted = false;
+            if let Some(Popup::Window(w)) = &mut self.popup {
+                if w.kind() == popovers::WindowKind::StyleEditor
+                    && w.style_id().as_deref().is_some_and(|id| style_targets.iter().any(|t| t == id))
+                {
+                    if let Ok(doc) = self.app.session.ds() {
+                        deleted = !w.refresh_style(cx, &doc.doc);
+                    }
+                }
+            }
+            if deleted {
+                self.close_popup(cx);
+            } else {
+                cx.notify();
+            }
         }
 
         let items: Vec<(panels::Prop, f64)> = self.pending.borrow_mut().drain(..).collect();
@@ -2171,7 +2203,7 @@ impl CanvasView {
                                 f32::from(e.position.y),
                             );
                             if double {
-                                this.left_w = panels::DEFAULT_PANEL;
+                                this.left_w = panels::DEFAULT_LEFT_PANEL;
                                 crate::resize_drag::end_drag(crate::resize_drag::Handle::LeftPanel);
                                 cx.notify();
                                 return;
@@ -2180,7 +2212,7 @@ impl CanvasView {
                         ResizeSide::Right => {
                             // 右栏维持现状：沿用 `resizing` 状态机 + 根 div 内联路由。
                             if e.click_count >= 2 {
-                                this.right_w = panels::DEFAULT_PANEL;
+                                this.right_w = panels::DEFAULT_RIGHT_PANEL;
                                 this.resizing = None;
                                 cx.notify();
                                 return;
@@ -3534,7 +3566,7 @@ impl CanvasView {
 
         cx: &mut Context<Self>,
     ) {
-        let w = popovers::WindowState::color(cx, origin, current, on_pick, self.fields.queue());
+        let w = popovers::WindowState::color(cx, origin, current, None, on_pick, self.fields.queue());
 
         self.open_window(w, cx);
     }
@@ -3653,6 +3685,15 @@ impl CanvasView {
     }
 
     fn move_popup_drag(&mut self, at: Point<Pixels>, pressed: bool) -> bool {
+        // 样式面板上的**子浮层**（取色器 / 排版设置）有自己的 `hold`：先推进它，父卡片一点都不动
+        // （用户 2026-11-15：「打开的第 2 个窗口跟他绑死在一起了，这不对」）。
+        if self.sub_drag_active() {
+            if !pressed {
+                self.end_sub_drag();
+                return true;
+            }
+            return self.sub_drag_move(at);
+        }
         // 统一路由：resize（editor 按住边缘 handle）改窗口尺寸，否则整卡移动。**每次移动都直接
 
         // 改状态并让调用方 notify，绝不节流**：
@@ -3668,6 +3709,23 @@ impl CanvasView {
         //     不是渲染慢，根因就是这段节流。
 
         self.active_window_mut().is_some_and(|w| w.variables_route_move(at)) || self.dialog.as_mut().is_some_and(|d| d.route_move(at))
+    }
+
+    /// 样式面板的子浮层（取色器 / 排版设置）正在按或拖：窗口级 move / up 必须优先给它。
+    ///
+    /// 子浮层不占 root 的 `popup` 单槽，`active_window_mut` 拿不到它，所以单独走一条。
+    fn sub_drag_active(&self) -> bool {
+        self.active_window().is_some_and(|w| w.sub_pending() || w.sub_dragging())
+    }
+
+    fn sub_drag_move(&self, at: Point<Pixels>) -> bool {
+        self.active_window().is_some_and(|w| w.sub_move_drag(at))
+    }
+
+    fn end_sub_drag(&self) {
+        if let Some(w) = self.active_window() {
+            w.sub_end_drag();
+        }
     }
 
     /// 尺寸拖动的**窗口级接管**：左面板宽 + 底栏时间轴高共用 `resize_drag`。
@@ -3731,13 +3789,14 @@ impl CanvasView {
     /// during a drag (that is the expensive part that made dragging feel sticky).
 
     fn popup_dragging(&self) -> bool {
-        self.active_window().is_some_and(|w| w.dragging()) || self.dialog.as_ref().is_some_and(|d| d.dragging())
+        // 子浮层（取色器 / 排版设置）与父卡片各有各的 `hold`，两者都算「弹窗在拖」。
+        self.active_window().is_some_and(|w| w.dragging() || w.sub_dragging()) || self.dialog.as_ref().is_some_and(|d| d.dragging())
     }
 
     /// True while a press on a popover is held but hasn't moved enough to count as a drag.
 
     fn popup_pending(&self) -> bool {
-        self.active_window().is_some_and(|w| w.pending().is_some()) || self.dialog.as_ref().is_some_and(|d| d.pending())
+        self.active_window().is_some_and(|w| w.pending().is_some() || w.sub_pending()) || self.dialog.as_ref().is_some_and(|d| d.pending())
     }
 
     /// 正在做「高频、只改几何」的拖动：整卡移动 / 画布平移 / 缩放框 / 左右工具栏拖宽 /
@@ -3788,6 +3847,10 @@ impl CanvasView {
 
             w.variables_end_drag();
         }
+
+        // 子浮层的 hold 与父卡片无关，收尾也要各收各的。
+
+        self.end_sub_drag();
 
         if let Some(d) = &mut self.dialog {
             d.end_drag();
@@ -4139,6 +4202,52 @@ impl CanvasView {
 
 impl Render for CanvasView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // DEBUG-PICKER: `FIGCRAFT_DEBUG_PICKER=1`（或 `=grad`）在启动首帧自动打开取色器面板，
+        // 供截图核对 1:1 版式；不含任何运行时逻辑，核完即删。
+        if let Ok(mode) = std::env::var("FIGCRAFT_DEBUG_PICKER") {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            let mut fire = false;
+            ONCE.call_once(|| fire = true);
+            if fire {
+                let base = figcraft_color::Color::from_rgba8(0x2D, 0x9C, 0xDB, 255);
+                let mut paint = figcraft_color::Paint::solid(base);
+                if mode == "grad" {
+                    paint.kind = figcraft_color::PaintKind::Gradient(figcraft_color::Gradient::default_for(
+                        figcraft_color::GradientKind::Linear,
+                        base,
+                    ));
+                }
+                let picker = popovers::PaintPicker { paint, on_write: std::rc::Rc::new(|_, _, _| {}) };
+                let w = popovers::WindowState::color(
+                    cx,
+                    gpui::point(px(160.0), px(60.0)),
+                    Color32::from_rgb(0x2D, 0x9C, 0xDB),
+                    Some(picker),
+                    std::rc::Rc::new(|_, _, _| {}),
+                    self.fields.queue(),
+                );
+                self.open_window(w, cx);
+            }
+        }
+        // Keep the colour picker's "On this page" swatches in step with the document. The walk is
+        // cached per (document, page), so this is a pointer compare on most frames.
+        if let Ok(ds) = self.app.session.ds() {
+            popovers::cache_page_colors(&ds.doc, ds.page);
+        }
+
+        // The canvas eyedropper samples into `tool.picked`; hand the sample to the open picker.
+        // Deferred: the picker's callback updates this entity, which cannot run inside render.
+        if let Some(picked) = self.app.session.tool.picked.take() {
+            let cb = match &self.popup {
+                Some(Popup::Window(w)) if w.kind() == popovers::WindowKind::Color => w.color_on_pick(),
+                _ => None,
+            };
+            if let Some(cb) = cb {
+                let c = popovers::picker_c32(picked);
+                window.defer(cx, move |window, cx| cb(c, window, cx));
+            }
+        }
+
         // Inline rename commits land here (see `inline_rename_pending`): Enter, focus-out or a
 
         // click elsewhere all go through the same queue, and the editor is closed either way.
@@ -4199,6 +4308,30 @@ impl Render for CanvasView {
 
         if control::drain(&mut self.app, &self.control_queue) {
             cx.notify();
+        }
+
+        // 控制通道的窗口按键（`ui.keystroke`）：交给 `dispatch_keystroke`，走的是和真键盘
+        // 完全相同的焦点链（面板 / 列表的 `on_key_down`、快捷键），而不是 `ui.key` 那条画布
+        // keymap。投递排到**帧后的 defer**：`dispatch_event` 会顺手 `draw()`，在 render 里
+        // 重入会把手势与焦点簿记搅乱（实测：直接投递时根节点的 `on_key_down` 收不到）。
+        let keys = control::take_keys();
+
+        if !keys.is_empty() {
+            window.defer(cx, move |window, cx| {
+                for k in keys {
+                    let Ok(mut ks) = gpui::Keystroke::parse(&k) else { continue };
+                    // `Keystroke::parse` 只解析键名，不带 `key_char`；平台真实按键的可打印
+                    // 字符由 `WM_CHAR` 补上。这里照同一规则补：单字符、无修饰键 → 就是字符本身，
+                    // 否则输入框永远收不到文字（只能测快捷键）。
+                    if ks.key_char.is_none()
+                        && ks.key.chars().count() == 1
+                        && ks.modifiers.number_of_modifiers() == 0
+                    {
+                        ks.key_char = Some(ks.key.clone().into());
+                    }
+                    window.dispatch_keystroke(ks, cx);
+                }
+            });
         }
 
         // 画布 ↔ 右栏：先写回提交的字段，再把选中/几何刷回面板。
@@ -5021,7 +5154,7 @@ impl Render for CanvasView {
                 }),
             )
             // 键盘：空格 = 平移工具，Z = 缩放工具（Alt 缩小）。
-            .on_key_down(cx.listener(|this: &mut CanvasView, e: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(|this: &mut CanvasView, e: &KeyDownEvent, window, cx| {
                 this.mods = e.keystroke.modifiers;
 
                 // R4/R5: Escape cancels an inline rename (egui `Rename` keeps the old name);
@@ -5159,11 +5292,21 @@ impl Render for CanvasView {
                     }
                 }
 
+                // Local styles 列表的键盘已移到**根节点**（见 `render` 末尾的
+                // `.on_key_down`）：这里只覆盖画布子树，焦点在右栏的列表行时收不到。
+
                 // 通用拖拽：Escape 取消（egui `ListDrag::with_order` 的语义），既不当成点击选中，
 
                 // 也不把这一次按键送给引擎。
 
                 if e.keystroke.key == "escape" && this.layer_cancel_drag(cx) {
+                    return;
+                }
+
+                // Local styles 列表：Escape 取消整行拖动（egui `ListDrag::with_order`），
+                // 不提交 style.move，也不继续往下传给引擎。
+
+                if e.keystroke.key == "escape" && this.fields.cancel_local_style_key() {
                     return;
                 }
 
@@ -6598,6 +6741,24 @@ impl Render for CanvasView {
                     this.commit_edits(window, cx);
                 }),
             )
+            // Local styles 列表的键盘（↑/↓ / Enter / Delete / Ctrl+C / Ctrl+V / Ctrl+D）。
+            // 必须挂在**根节点**上：GPUI 的按键沿焦点链派发（root → 焦点节点），而画布那个
+            // `on_key_down` 只覆盖画布子树——焦点在右栏的列表行时按键到不了它，列表键盘
+            // 就成了死代码。这里只在列表真的拿到焦点时消费（`local_style_key` 自己判断），
+            // 其它情况原样放行给内层控件与画布。
+            .on_key_down(cx.listener(|this: &mut CanvasView, e: &KeyDownEvent, window, cx| {
+                let accel = e.keystroke.modifiers.platform || e.keystroke.modifiers.control;
+
+                if this.fields.local_style_key(&e.keystroke.key, accel, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+
+                // Escape 撤掉内联改名（`TextEdit` 自己不处理 Escape，只靠这条）。
+                if e.keystroke.key == "escape" && this.fields.cancel_local_style_key() {
+                    cx.stop_propagation();
+                }
+            }))
             // B9：Hide UI 与 Minimize UI 都收起导航标签条（`view.minimize` 收导航栏）。
             .when(!ui_hidden && !ui_minimized, |d| d.child(tab_bar))
             .child(top_row)

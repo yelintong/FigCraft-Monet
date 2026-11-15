@@ -27,7 +27,7 @@ pub(crate) mod right;
 /// A field's width before the panel reports its own (`col_width(280)`).
 pub(crate) const DEFAULT_COL: f32 = 108.0;
 /// The fixed left icon rail.
-pub(crate) const RAIL_W: f32 = 56.0;
+pub(crate) const RAIL_W: f32 = 57.0;
 /// 左竖栏里图标按钮的边长（`left_rail` 的 `IconButton::size(32.0)`）。
 const RAIL_BTN: f32 = 32.0;
 /// 左竖栏的上下内边距（`left_rail` 的 `py(pt(8.0))`）。
@@ -125,6 +125,11 @@ mod divider_tests {
 pub(crate) const MIN_PANEL: f32 = 240.0;
 pub(crate) const MAX_PANEL: f32 = 500.0;
 pub(crate) const DEFAULT_PANEL: f32 = 280.0;
+/// 窗口布局的默认宽度，按 Figma 参考（`--left-panel-width: 421px` /
+/// `--right-panel-width: 374px` / `--left-rail-width: 57px`）。左右栏宽度本来就不同，
+/// 不能再共用一个 `DEFAULT_PANEL`。
+pub(crate) const DEFAULT_LEFT_PANEL: f32 = 421.0;
+pub(crate) const DEFAULT_RIGHT_PANEL: f32 = 374.0;
 
 /// A right-panel field that writes back to the selected node via `node.set`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -223,15 +228,31 @@ pub(crate) struct Cmd {
 pub(crate) struct CmdQueue {
     items: std::rc::Rc<std::cell::RefCell<Vec<Cmd>>>,
     wake: std::rc::Rc<dyn Fn()>,
+    /// 出口改写：派生的队列（[`CmdQueue::mapped`]）在入队前先把命令改一遍。默认 `None`
+    /// —— 也就是所有既有按钮的行为完全不变。
+    map: Option<std::rc::Rc<dyn Fn(Cmd) -> Cmd>>,
 }
 
 impl CmdQueue {
     pub(crate) fn new(wake: &std::rc::Rc<dyn Fn()>) -> Self {
-        Self { items: Default::default(), wake: wake.clone() }
+        Self { items: Default::default(), wake: wake.clone(), map: None }
+    }
+
+    /// 派生一个**共用同一条队列**、但每条命令入队前先过 `map` 的句柄。
+    ///
+    /// 用途：样式编辑器里的 Type settings 与「选中节点的 Type settings」共用同一份正文，
+    /// 那批行全是写死的 `node.set { props }`；样式那边应该写回 `style.update`。有了改写，
+    /// 就不用把几十处 `Opt::new(.., "node.set", ..)` 逐个参数化。
+    pub(crate) fn mapped(&self, map: std::rc::Rc<dyn Fn(Cmd) -> Cmd>) -> Self {
+        Self { items: self.items.clone(), wake: self.wake.clone(), map: Some(map) }
     }
 
     /// Enqueue and force the frame that runs it.
     pub(crate) fn push(&self, cmd: Cmd) {
+        let cmd = match &self.map {
+            Some(f) => f(cmd),
+            None => cmd,
+        };
         self.items.borrow_mut().push(cmd);
         (self.wake)();
     }
@@ -529,6 +550,10 @@ pub(crate) struct RightFields {
     /// 键是 **(样式类型, 文件夹路径)**：text 与 paint 可以各有 `Brand/Colors`，只按 path 会让
     /// 两行同时进入编辑态、共用同一个输入框。复用通用 `TextField`（`local_style_rename_input`）。
     local_style_renaming: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+    /// Local styles **样式行**双击改名：`(样式类型, 样式 id, 所在文件夹, 位置锚点)`。与文件夹改名
+    /// 共用同一个内联输入框实体，但提交的是 `style.move {styles:[id], name, before}`
+    /// （引擎没有独立的 `style.rename`；`before` 是紧跟其后的同类型样式，缺了会被挪到列表末尾）。
+    local_style_rename_style: std::rc::Rc<std::cell::RefCell<Option<(String, String, String, Option<String>)>>>,
     /// Local styles 文件夹内联重命名输入框（egui `rename_field`）；提交即 `style.renameFolder`。
     local_style_rename_input: Entity<TextField>,
     /// 重命名输入框是否**曾经**进入过编辑态。用来区分「刚打开、焦点还没生效」与「编辑真的
@@ -536,6 +561,11 @@ pub(crate) struct RightFields {
     local_style_rename_seen: std::rc::Rc<std::cell::RefCell<bool>>,
     /// Local styles 文件夹的折叠态（egui `folded_id`）：键为 `"<type>/<folder path>"`。
     local_style_folded: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// Local styles 列表的拖动排序状态（egui `ListDrag::in_order` + `drop_move` → `style.move`）：
+    /// 渲染期写入每行的落点表，事件期解析插入缝。
+    local_styles_ui: std::rc::Rc<std::cell::RefCell<crate::panels::right::sections::LocalStyleUi>>,
+    /// Local styles 列表的 Tab 焦点句柄（键盘导航 / a11y）。
+    local_style_focus: gpui::FocusHandle,
     /// A3: the Comments panel's local state (filter / sort / search / open thread).
     comment_ui: crate::comments::CommentState,
     /// Inspect 标签的三个选择：代码语言下标、颜色格式下标、Web 语言是否用 rem。
@@ -819,6 +849,123 @@ fn nf_pad(
 }
 
 impl RightFields {
+    /// Escape 取消 Local styles 的拖动 / 文件夹内联重命名（egui `ListDrag::with_order`
+    /// 与 `text_field_inline` 的 Esc）：清状态、不发命令、不让按键继续传给引擎。
+    pub(crate) fn cancel_local_style_key(&self) -> bool {
+        if self.local_styles_ui.borrow().drag.is_some() {
+            self.local_styles_ui.borrow_mut().drag = None;
+            self.cmds.wake();
+            return true;
+        }
+        if self.local_style_renaming.borrow().is_some() {
+            // 先清状态：通用 TextEdit 随后的失焦 `on_commit` 会因 `renaming` 已空直接返回，
+            // 草稿不会被写成 `style.renameFolder`（egui `a11y::spend_escape` 同款）。
+            self.local_style_renaming.borrow_mut().take();
+            *self.local_style_rename_seen.borrow_mut() = false;
+            self.cmds.wake();
+            return true;
+        }
+        // 行内改名（双击样式名）用的是另一个槽位 `local_style_rename_style`：Escape 同样要
+        // 把它撤掉，否则输入框一直挂着（`TextEdit` 自己不处理 Escape，只靠这条）。
+        if self.local_style_rename_style.borrow().is_some() {
+            self.local_style_rename_style.borrow_mut().take();
+            *self.local_style_rename_seen.borrow_mut() = false;
+            self.cmds.wake();
+            return true;
+        }
+        false
+    }
+
+    /// Local styles 列表的键盘（点中行 / Tab 聚焦 `local_style_focus` 后生效）：
+    /// ↑/↓ 移动选中行、Enter 打开样式编辑器、Delete/Backspace 删除、Ctrl+C 复制、
+    /// Ctrl+V 粘贴（`<原名> copy`）、Ctrl+D 复制一份。
+    /// 返回是否消费了这次按键；Escape 只清选中、不消费，让通用 Escape 链继续。
+    ///
+    /// 注意调用点：监听挂在**根节点**（`render` 末尾），画布那个 `on_key_down` 只覆盖画布
+    /// 子树，焦点在右栏时收不到按键。
+    pub(crate) fn local_style_key(&self, key: &str, accel: bool, window: &mut gpui::Window, cx: &mut gpui::App) -> bool {
+        if std::env::var_os("FIGCRAFT_KEY_LOG").is_some() {
+            eprintln!(
+                "[ls-key] key={key} accel={accel} focused={} rows={}",
+                self.local_style_focus.is_focused(window),
+                self.local_styles_ui.borrow().rows.len()
+            );
+        }
+        if !self.local_style_focus.is_focused(window) {
+            return false;
+        }
+        let mut st = self.local_styles_ui.borrow_mut();
+        if st.rows.is_empty() {
+            return false;
+        }
+        match key {
+            "up" | "down" => {
+                let n = st.rows.len();
+                let cur = st.sel.unwrap_or(0);
+                st.sel = Some(if key == "up" { cur.saturating_sub(1) } else { (cur + 1).min(n - 1) });
+            }
+            "enter" => {
+                let Some(k) = st.sel else { return false };
+                let Some(r) = st.rows.get(k).cloned() else { return false };
+                drop(st);
+                self.popups().request(crate::popovers::WindowState::style_editor(
+                    self.cmds.clone(),
+                    cx,
+                    window.mouse_position(),
+                    gpui::SharedString::from(figcraft_i18n::tr("Edit style")),
+                    r.ty,
+                    r.id,
+                    r.name,
+                    r.description,
+                    r.properties,
+                    r.paints,
+                    r.text.clone(),
+                    r.effects.clone(),
+                    r.grids.clone(),
+                    self.popups(),
+                ));
+            }
+            "delete" | "backspace" => {
+                let Some(k) = st.sel else { return false };
+                let id = st.rows[k].id.clone();
+                drop(st);
+                self.cmds.push(Cmd { id: "style.delete", params: Some(serde_json::json!({ "style": id })) });
+            }
+            "d" if accel => {
+                let Some(k) = st.sel else { return false };
+                let id = st.rows[k].id.clone();
+                drop(st);
+                self.cmds.push(Cmd { id: "style.duplicate", params: Some(serde_json::json!({ "style": id })) });
+            }
+            // 复制：记住选中行的整份快照（类型 / 名字 / 描述 / 值），粘贴时据此 `style.create`。
+            "c" if accel => {
+                let Some(k) = st.sel else { return false };
+                st.clip = st.rows.get(k).cloned();
+            }
+            // 粘贴：在**同文件夹**下建一份 `<原名> copy`（重名则编号）。
+            "v" if accel => {
+                let Some(src) = st.clip.clone() else { return false };
+                let name = crate::panels::right::sections::ls_paste_name(&st.names, &src.name);
+                let value = crate::panels::right::sections::ls_style_value(&src);
+                let params = serde_json::json!({
+                    "type": src.ty,
+                    "name": name,
+                    "description": src.description,
+                    "value": value,
+                });
+                drop(st);
+                self.cmds.push(Cmd { id: "style.create", params: Some(params) });
+            }
+            "escape" => {
+                st.sel = None;
+                return false;
+            }
+            _ => return false,
+        }
+        self.cmds.wake();
+        true
+    }
+
     pub(crate) fn new(cx: &mut App, pending: &Pending, wake: &std::rc::Rc<dyn Fn()>) -> Self {
         let cmds: Cmds = CmdQueue::new(wake);
         let n = |cx: &mut App, lead: &'static str, val: f64, suffix: &str, step: f64, prop: Option<Prop>| {
@@ -900,6 +1047,8 @@ impl RightFields {
         }
         let scale_ctx = std::rc::Rc::new(std::cell::RefCell::new(crate::panels::right::data::ScaleData::default()));
         let local_style_renaming = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+        let local_style_rename_style =
+            std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String, String, Option<String>)>));
         let mut fields = Self {
             x: n(cx, "X", 0.0, "", 1.0, Some(Prop::X)),
             y: n(cx, "Y", 0.0, "", 1.0, Some(Prop::Y)),
@@ -929,16 +1078,33 @@ impl RightFields {
             selection_colors_hover: std::rc::Rc::new(std::cell::RefCell::new(false)),
             right_tab: std::rc::Rc::new(std::cell::RefCell::new(0u8)),
             local_style_renaming: local_style_renaming.clone(),
+            local_style_rename_style: local_style_rename_style.clone(),
             local_style_rename_seen: std::rc::Rc::new(std::cell::RefCell::new(false)),
             local_style_rename_input: TextField::build(cx, DEFAULT_COL, {
                 let renaming = local_style_renaming.clone();
+                let renaming_style = local_style_rename_style.clone();
                 let cmds = cmds.clone();
                 move |tf, _| {
                     tf.set_on_commit(move |text: &str, _window, _cx| {
-                        // 状态是 (类型, 路径)：类型必须传给引擎，否则同名文件夹下
-                        // 其它类型的样式会被一起改名。
-                        let Some((ty, folder)) = renaming.borrow_mut().take() else { return };
                         let name = text.trim().to_string();
+                        // ① 样式行双击改名：提交 `style.move {styles:[id], name:"<folder>/<新名>"}`。
+                        //    名字是全名，文件夹前缀必须保留，否则会把样式挪出文件夹。
+                        if let Some((_ty, id, folder, before)) = renaming_style.borrow_mut().take() {
+                            if name.is_empty() {
+                                return;
+                            }
+                            let full = if folder.is_empty() { name } else { format!("{folder}/{name}") };
+                            // 不带 `before` 会把样式挪到列表末尾（引擎语义），这里带上原来的位置锚点。
+                            let mut params = serde_json::json!({ "styles": [id], "name": full });
+                            if let Some(b) = before {
+                                params["before"] = serde_json::Value::String(b);
+                            }
+                            cmds.push(Cmd { id: "style.move", params: Some(params) });
+                            return;
+                        }
+                        // ② 文件夹改名：状态是 (类型, 路径)：类型必须传给引擎，否则同名文件夹下
+                        //    其它类型的样式会被一起改名。
+                        let Some((ty, folder)) = renaming.borrow_mut().take() else { return };
                         if name.is_empty() || name == folder {
                             return;
                         }
@@ -947,6 +1113,10 @@ impl RightFields {
                 }
             }),
             local_style_folded: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
+            local_styles_ui: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::panels::right::sections::LocalStyleUi::default(),
+            )),
+            local_style_focus: cx.focus_handle(),
             comment_ui: std::rc::Rc::new(std::cell::RefCell::new(crate::comments::CommentUi::default())),
             inspect_lang: std::rc::Rc::new(std::cell::RefCell::new(0usize)),
             inspect_fmt: std::rc::Rc::new(std::cell::RefCell::new(0usize)),

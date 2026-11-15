@@ -1207,6 +1207,19 @@ pub struct LocalStyleRow {
     /// 文本样式："32/Auto" 预览（egui 的 `text_meta`）；其余类型为 `None`。
     pub text_meta: Option<String>,
     pub description: String,
+    /// 样式编辑弹窗的 Properties 行（egui `editor()` 的 `property_row` 标签），在快照时
+    /// 从 `StyleKind` 生成，避免弹窗回读文档，也避免用编造的占位文本。
+    pub properties: Vec<String>,
+    /// paint 样式的完整 paints 数组（原始顺序）。属性行点开取色器后要整体写回
+    /// `style.update {value: paints}`，所以不能只留最后一个。
+    pub paints: Vec<Paint>,
+    /// 文本样式的完整 `TextStyle` JSON（camelCase，引擎 `text_style_json` 也认 snake_case）；
+    /// 编辑时整体写回 `style.update {value: …}`，缺字段会被引擎按默认重置，所以必须整段保留。
+    pub text: Option<serde_json::Value>,
+    /// 效果样式的完整 effects 数组（每个含原始 JSON，供写回 `style.update {value: …}`）。
+    pub effects: Option<Vec<EffectRow>>,
+    /// 网格样式的完整 grids 数组（每个含原始 JSON，供写回 `style.update {value: …}`）。
+    pub grids: Option<Vec<GridRow>>,
 }
 
 /// 右栏所有列表的一次快照。`None` 的 Vec 表示「多选且值不一致」（egui 显示 Mixed / 提示点 + 替换）。
@@ -1430,7 +1443,81 @@ pub fn read(doc: &Document, ids: &[NodeId], page: Option<NodeId>, ready_filter: 
                 StyleKind::Text { style, .. } => (None, Some(format!("{}/{}", trim_num(style.font_size), style.line_height.label()))),
                 _ => (None, None),
             };
-            LocalStyleRow { id: s.id.to_string(), name: s.name.clone(), ty: s.kind.type_name(), paint, text_meta, description: s.description.clone() }
+            // egui `editor()` 的 Properties：paint 从上到下倒序列出（与 Fill 区一致），
+            // text / effect / grid 各按自己的标签列。
+            let properties = match &s.kind {
+                StyleKind::Paint { paints } => paints.iter().rev().map(|p| p.label()).collect(),
+                StyleKind::Text { style, .. } => vec![format!("{} / {}", trim_num(style.font_size), style.line_height.label())],
+                StyleKind::Effect { effects } => effects.iter().rev().map(|e| e.label().to_string()).collect(),
+                StyleKind::Grid { grids } => grids.iter().map(|_g| String::from("Grid")).collect(), // TEMP-PATCH(build unblock)
+            };
+            let paints = match &s.kind {
+                StyleKind::Paint { paints } => paints.clone(),
+                _ => Vec::new(),
+            };
+            let text = match &s.kind {
+                StyleKind::Text { style, .. } => serde_json::to_value(style).ok(),
+                _ => None,
+            };
+            let effects = match &s.kind {
+                StyleKind::Effect { effects } => {
+                    let effs = effects.clone();
+                    Some(
+                        effs
+                            .iter()
+                            .enumerate()
+                            .map(|(index, e)| EffectRow {
+                                index,
+                                label: e.label().to_string(),
+                                ty: match e.kind {
+                                    figcraft_doc::EffectKind::DropShadow(_) => "dropShadow",
+                                    figcraft_doc::EffectKind::InnerShadow(_) => "innerShadow",
+                                    figcraft_doc::EffectKind::LayerBlur(_) => "layerBlur",
+                                    figcraft_doc::EffectKind::BackgroundBlur(_) => "backgroundBlur",
+                                    figcraft_doc::EffectKind::Noise(_) => "noise",
+                                    figcraft_doc::EffectKind::Texture(_) => "texture",
+                                    figcraft_doc::EffectKind::Glass(_) => "glass",
+                                },
+                                visible: e.visible,
+                                effect: serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            };
+            let grids = match &s.kind {
+                StyleKind::Grid { grids } => {
+                    let gl = grids.clone();
+                    let grids_json = serde_json::to_value(&gl).unwrap_or(serde_json::Value::Array(vec![]));
+                    Some(
+                        gl.iter()
+                            .enumerate()
+                            .map(|(index, g)| GridRow {
+                                index,
+                                label: grid_label(g),
+                                color: g.color.to_hex(),
+                                visible: g.visible,
+                                grids: grids_json.clone(),
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            };
+            LocalStyleRow {
+                id: s.id.to_string(),
+                name: s.name.clone(),
+                ty: s.kind.type_name(),
+                paint,
+                text_meta,
+                description: s.description.clone(),
+                properties,
+                paints,
+                text,
+                effects,
+                grids,
+            }
         })
         .collect();
     if ids.is_empty() {
@@ -1876,7 +1963,7 @@ pub fn read(doc: &Document, ids: &[NodeId], page: Option<NodeId>, ready_filter: 
     d
 }
 
-fn grid_label(g: &figcraft_doc::LayoutGrid) -> String {
+pub(crate) fn grid_label(g: &figcraft_doc::LayoutGrid) -> String {
     use figcraft_doc::GridKind;
     let trim = |v: f64| format!("{v}");
     match g.kind {

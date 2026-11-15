@@ -15,6 +15,8 @@
 //! - `ui.inspect {}` — 工具/视图/画布矩形/帧统计
 //! - `ui.pointer {kind, x, y | sx, sy, to?, steps?, shift?, alt?, cmd?, ctrl?, pressure?}`
 //! - `ui.key {key, shift?, alt?, cmd?, ctrl?}` — 当作在画布上按下的快捷键
+//! - `ui.keystroke {key}` — 当作在**窗口**上按下（`ctrl-c` 这种 Keystroke 串）：交给
+//!   `Window::dispatch_keystroke`，走焦点链 / `on_key_down` / 快捷键，和真按键盘同一条路由
 //! - `ui.type {text}` — 往正在编辑的文字里输入
 //! - `ui.render {path?, scale?, ids?}` — 文档 PNG（不含界面，无窗口也能出图）
 //!
@@ -33,6 +35,17 @@ use figcraft_engine::{PointerEvent, PointerKind};
 use serde_json::{Value, json};
 
 use crate::CanvasApp;
+
+// 排队待投递的窗口按键（`ui.keystroke`）。控制通道只入队：投递要 `&mut Window`，只有
+// 真实的一帧（`CanvasView::render`）里有，见 [`take_keys`]。
+thread_local! {
+    static KEYS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 取走这一帧要投递的窗口按键（`ui.keystroke` 入的队）。
+pub fn take_keys() -> Vec<String> {
+    KEYS.with(|k| std::mem::take(&mut *k.borrow_mut()))
+}
 
 /// 跨线程唤醒 UI 线程（原文的 `egui::Context::request_repaint`）。
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -251,6 +264,16 @@ pub fn handle(app: &mut CanvasApp, method: &str, p: &Value) -> Result<Value, Str
                 }
                 _ => Err(format!("no shortcut `{key}`")),
             }
+        }
+        // 窗口级按键：只入队，由下一帧的 `render` 用 `Window::dispatch_keystroke` 投递。
+        // 和 `ui.key`（画布快捷键）是两回事：这条走 GPUI 的焦点链，能测到面板/列表的按键。
+        "ui.keystroke" => {
+            let key = p.get("key").and_then(Value::as_str).ok_or("`key` required")?;
+            if gpui::Keystroke::parse(key).is_err() {
+                return Err(format!("bad keystroke `{key}`"));
+            }
+            KEYS.with(|k| k.borrow_mut().push(key.to_string()));
+            Ok(json!({ "ok": true }))
         }
         "ui.type" => {
             let text = p.get("text").and_then(Value::as_str).ok_or("`text` required")?;

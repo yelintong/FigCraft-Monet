@@ -99,6 +99,12 @@ pub struct Popover {
     on_up: Option<Rc<dyn Fn(&gpui::MouseUpEvent, &mut Window, &mut App)>>,
     /// 全屏呈现（egui `Frame::NONE`）：不画圆角/阴影、不加内边距，位置也不被 `clamp` 夹离。
     flush: bool,
+    /// 卡片**真实**高度（pt）的回调：`show` 在内容的末尾放一把 0 高的标尺，回调给的是
+    /// 「标尺的 y − 卡片原点」，也就是这张卡片真正占的高度。
+    ///
+    /// 构造期的 `height` 只是估算：估算偏大时 `clamp` 会把卡片钉在上面、一点都拖不动
+    /// （用户 2026-11-15：「第 2 个窗口没有办法拖动」）。调用方拿到真实高度后下一帧修正。
+    measure: Option<Rc<dyn Fn(Pixels)>>,
 }
 
 impl Popover {
@@ -117,7 +123,15 @@ impl Popover {
             on_move: None,
             on_up: None,
             flush: false,
+            measure: None,
         }
+    }
+
+    /// 量出这张卡片的真实高度（pt）：调用方据此修正 `height`，`clamp` 才不会因为估算偏大
+    /// 把卡片钉死。
+    pub fn on_measure(mut self, f: impl Fn(Pixels) + 'static) -> Self {
+        self.measure = Some(Rc::new(f));
+        self
     }
 
     /// Fullscreen presentation (egui `Frame::NONE`): no card padding, no rounded corners, no shadow,
@@ -238,6 +252,17 @@ impl Popover {
         }
         if let Some(body) = self.body {
             stack = stack.child(div().w_full().flex().flex_col().p(pt(pad)).child(body));
+        }
+        // 真实高度标尺：内容末尾放一个 0 高、铺宽的 canvas。它的 y 减卡片原点就是这张卡片
+        // 实际占的高度（构造期的 `height` 只是估算，估不准会让 `clamp` 把卡片钉死）。
+        if let Some(f) = self.measure.clone() {
+            let top = origin;
+            stack = stack.child(
+                gpui::canvas(move |bounds, _, _| f(bounds.origin.y - top.y), |_, _, _, _| {})
+                    .flex_none()
+                    .w_full()
+                    .h(px(0.0)),
+            );
         }
 
         // X 浮在右上角，不占布局行。

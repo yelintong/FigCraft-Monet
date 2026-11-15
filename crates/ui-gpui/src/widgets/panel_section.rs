@@ -108,6 +108,13 @@ pub fn field_row_full(el: impl IntoElement) -> FieldRow {
     FieldRow { fields: vec![el.into_any_element()], trailing: Vec::new(), span: 2, free: None, height: None }
 }
 
+/// A section-level block that owns its own vertical rhythm and insets: no grid columns, no
+/// fixed 32 pt row height, no trailing 24 pt cell. Needed by lists whose rows were tuned to
+/// their own pitch (egui `style_picker::local_styles` uses 24 pt rows and 8/16 pt gaps).
+pub fn block_row(el: impl IntoElement) -> FieldRow {
+    FieldRow { fields: Vec::new(), trailing: Vec::new(), span: 0, free: Some(el.into_any_element()), height: None }
+}
+
 /// A row whose element spans **both** field columns **and** keeps trailing 24 pt icon cells.
 /// `ui-egui` builds a paint / effect / grid row as one field of `available_width - 56` followed
 /// by an `icon_pair` (two 24 pt buttons 4 apart); on the unified grid that is exactly one

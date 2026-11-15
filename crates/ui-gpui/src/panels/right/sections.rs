@@ -15,15 +15,16 @@ use crate::canvas::geom::Color32;
 use crate::motion::{Act, Queue};
 use crate::panels::{Cmd, ROW_EDITORS, RightFields, RowEditCtx, visibility};
 use crate::widgets::{
-    ColorField, ColorText, Dropdown, FieldRow, HEADER_H, Icon, IconButton, MenuRow, PAD, PanelSection, SECTION_BOTTOM, SectionHeader,
-    SectionHeaderVariant, Segmented, TITLE_PT, field_row, field_row_full, field_row_full_trailing, pt, rgba, sublabel_row, sublabel_row2, swatch,
-    tokens, variable_button,
+    ColorField, ColorText, Dropdown, HEADER_H, Icon, IconButton, MenuRow, PAD, PanelSection, SECTION_BOTTOM, SectionHeader,
+    SectionHeaderVariant, Segmented, TITLE_PT, block_row, field_row, field_row_full, field_row_full_trailing, pt, rgba, sublabel_row, sublabel_row2,
+    swatch, tokens, variable_button,
 };
 use figcraft_color::PaintKind;
 use figcraft_doc::NodeId;
 use figcraft_doc::anim::motion::AnimProperty;
-use gpui::{App, Bounds, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px, size};
+use gpui::{App, Bounds, Div, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Window, div, prelude::*, px, size};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -805,9 +806,25 @@ fn color_pick(
                 cmds.push(Cmd { id: cmd, params: Some(p) });
             }
         });
+        // The paint the row edits, so the picker can switch its kind / blend in place.
+        let picker = base_paint
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<figcraft_color::Paint>(v.clone()).ok())
+            .map(|paint| {
+                let write_cmds = cmds.clone();
+                let write_params = params.clone();
+                crate::popovers::PaintPicker {
+                    paint,
+                    on_write: Rc::new(move |np, _w, _cx| {
+                        let mut p = write_params.clone();
+                        p["paint"] = serde_json::to_value(&np).unwrap_or(Value::Null);
+                        write_cmds.push(Cmd { id: cmd, params: Some(p) });
+                    }),
+                }
+            });
         // Synchronous request, no detached async `spawn` and no root-Entity guard: the old
         // `cx.spawn(...).detach()` delayed the picker by a frame and could be dropped entirely.
-        let w = crate::popovers::WindowState::color(cx, pos, current, on_pick, cmds.clone());
+        let w = crate::popovers::WindowState::color(cx, pos, current, picker, on_pick, cmds.clone());
         popups.request(w);
     })
 }
@@ -1836,9 +1853,9 @@ pub(crate) fn typography(f: &RightFields, d: &PanelData) -> PanelSection {
 fn type_settings_button(f: &RightFields, d: &PanelData) -> IconButton {
     let popups = f.popups();
     let queue = f.queue();
-    let data = d.clone();
+    let text = d.text.clone().unwrap_or_default();
     IconButton::new(Icon::Menu).size(24.0).on_click(move |_e, window, cx: &mut App| {
-        popups.request(crate::popovers::WindowState::type_settings(queue.clone(), &data, cx, window.mouse_position()));
+        popups.request(crate::popovers::WindowState::type_settings(queue.clone(), &text, cx, window.mouse_position()));
     })
 }
 
@@ -2527,6 +2544,398 @@ pub(crate) fn header(f: &RightFields, d: &PanelData, col: f32) -> Option<gpui::D
     )
 }
 
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Local styles 列表：1:1 照抄 ui-egui `widgets/style_picker.rs::local_styles` 的微调参数。
+// 上游把这套尺寸逐项调过（16 pt 网格 / 24 pt 行 / 8-16-16 分组间距 / 圆形色板 / 整行拖动），
+// 任何一项都不得凭感觉改动。
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+/// Side inset of a row: the hover band starts and ends here, not at the panel's edges.
+const LS_INSET: f32 = 8.0;
+/// Where a row's content (and a caption's text) starts from the panel's edge.
+const LS_PAD: f32 = 16.0;
+/// Height of a group's caption row ("Text styles").
+const LS_CAPTION_H: f32 = 32.0;
+/// Height of a folder row (lizard `local_styles`: `allocate_exact_size(vec2(w, 24.0))`).
+const LS_FOLDER_H: f32 = 24.0;
+/// Height of a style row (lizard `local_styles`: `allocate_exact_size(vec2(w, 30.0))`).
+const LS_ROW_H: f32 = 30.0;
+/// A row's icon box, and the gap between it and the name.
+const LS_ICON: f32 = 16.0;
+const LS_ICON_GAP: f32 = 8.0;
+/// The hit area of a row's leading icon: the icon draws at 16, but the click target is 24×24 —
+/// the same size as the trailing settings button (用户 2026-11-15：只有点这两个图标才弹设置页)。
+const LS_ICON_HIT: f32 = 24.0;
+/// A second press on the same row within this window counts as a double click (rename).
+const LS_DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// How far a nesting level steps in: an icon box and its gap, so a child's icon sits under the
+/// folder's name.
+const LS_STEP: f32 = LS_ICON + LS_ICON_GAP;
+/// A folder's chevron, inside its 16 pt box.
+const LS_CHEVRON: f32 = 12.0;
+/// Gap above the first group's caption, and above every later one.
+const LS_FIRST_GAP: f32 = 8.0;
+const LS_GROUP_GAP: f32 = 16.0;
+/// Gap under the whole list.
+const LS_BOTTOM_PAD: f32 = 16.0;
+/// A row's trailing text (a text style's size and line height) ends this far from the band's edge.
+const LS_TRAIL: f32 = 8.0;
+/// Pointer travel before a press becomes a drag (egui `drag_started`).
+const LS_DRAG_DEADZONE: f32 = 3.0;
+
+/// 一行落点槽（egui `Slot`）：文件夹头或样式行，y 是**相对列表容器**的坐标。
+#[derive(Clone)]
+pub struct LsSlot {
+    pub ty: &'static str,
+    pub y0: f32,
+    pub y1: f32,
+    pub kind: LsSlotKind,
+}
+
+#[derive(Clone)]
+pub enum LsSlotKind {
+    Header { path: String },
+    Style { index: usize, id: String, name: String },
+}
+
+/// 一次拖动（egui `ListDrag` 存在 `ui.data` 的 temp data）。
+pub struct LocalStyleDrag {
+    pub ty: &'static str,
+    /// 组内样式序号（egui 每组 `styles` 的计数）。
+    pub from: usize,
+    pub id: String,
+    pub label: String,
+    /// 打开样式编辑器用的快照（egui `edit_local` 从 doc 读，这里渲染期备好，事件期不回读）。
+    pub name: String,
+    pub description: String,
+    pub properties: Vec<String>,
+    /// 颜色样式的完整 paints（编辑器预览块 + 属性行取色器写回）。
+    pub paints: Vec<figcraft_color::Paint>,
+    /// 文本样式的完整 `TextStyle` JSON（字号 / 行高 / 字距编辑写回）。
+    pub text: Option<serde_json::Value>,
+    /// 效果样式的完整 effects 数组（追加 / 删除 / 显隐写回）。
+    pub effects: Option<Vec<crate::panels::right::data::EffectRow>>,
+    /// 网格样式的完整 grids 数组（追加 / 删除 / 显隐写回）。
+    pub grids: Option<Vec<crate::panels::right::data::GridRow>>,
+    pub start: Point<Pixels>,
+    pub pointer: Point<Pixels>,
+    pub armed: bool,
+    /// 插入线的相对 y；None = 无处可落 / 空操作。
+    pub line_y: Option<f32>,
+    pub query: Option<Value>,
+}
+
+/// 键盘导航的一条可见样式行：带上打开编辑器所需的快照，按键时不用回读文档。
+#[derive(Clone)]
+pub struct LocalStyleKeyRow {
+    /// 相对列表容器的 y，用来画焦点框。
+    pub y0: f32,
+    pub ty: &'static str,
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub properties: Vec<String>,
+    pub paints: Vec<figcraft_color::Paint>,
+    pub text: Option<serde_json::Value>,
+    pub effects: Option<Vec<crate::panels::right::data::EffectRow>>,
+    pub grids: Option<Vec<crate::panels::right::data::GridRow>>,
+}
+
+/// 列表的跨帧状态：渲染期写落点表，事件期读。
+#[derive(Default)]
+pub struct LocalStyleUi {
+    pub drag: Option<LocalStyleDrag>,
+    pub slots: Vec<LsSlot>,
+    /// 全文档样式的 (id, name)，供 `moved_name` 查重。
+    pub names: Vec<(String, String)>,
+    /// 列表容器在窗口里的左上角（prepaint 写入），把指针换成相对坐标。
+    pub origin: Option<(f32, f32)>,
+    /// 键盘导航：按绘制顺序的样式行。
+    pub rows: Vec<LocalStyleKeyRow>,
+    /// 当前键盘选中的 `rows` 下标（`Tab` 聚焦列表后由方向键移动）。
+    pub sel: Option<usize>,
+    /// 上一次左键按下的是哪一行、什么时候：双击判定（同一行 400ms 内再按 = 改名）。
+    pub last_click: Option<(String, std::time::Instant)>,
+    /// 复制下来的样式（`Ctrl/Cmd+C`）：粘贴时用它 `style.create` 出一份新样式。
+    pub clip: Option<LocalStyleKeyRow>,
+}
+
+/// egui `style_picker::moved_name`：落进目标文件夹后取叶子名，重名则编号（"Sunset/600 2"）。
+fn ls_moved_name(names: &[(String, String)], moved_id: &str, moved: &str, folder: &str) -> String {
+    let leaf = moved.rsplit('/').next().unwrap_or(moved);
+    let named = |l: &str| if folder.is_empty() { l.to_string() } else { format!("{folder}/{l}") };
+    let taken = |n: &str| names.iter().any(|(id, name)| id != moved_id && name == n);
+    let first = named(leaf);
+    if !taken(&first) {
+        return first;
+    }
+    (2..).map(|k| named(&format!("{leaf} {k}"))).find(|n| !taken(n)).unwrap_or(first)
+}
+
+/// egui `style_picker::drop_move` 1:1：按「有多少槽的上沿在指针之上」定插入缝，算出
+/// `style.move` 的 `before` / `name`（把样式改名的同时挪进文件夹），并给出插入线的 y。
+/// `at_y` 是相对列表容器的 y；文件夹头注册为 Header，两侧都能接落点。
+fn ls_drop_move(all: &[LsSlot], names: &[(String, String)], ty: &'static str, from: usize, at_y: f32) -> Option<(f32, Value)> {
+    // 每个类型组是一张独立的列表（egui `ListDrag::in_order(ui, ("local_styles", slot.key()))`）。
+    let slots: Vec<&LsSlot> = all.iter().filter(|s| s.ty == ty).collect();
+    let (fp, moved_id, moved_name) = slots.iter().enumerate().find_map(|(i, s)| match &s.kind {
+        LsSlotKind::Style { index, id, name } if *index == from => Some((i, id.clone(), name.clone())),
+        _ => None,
+    })?;
+    let (line, y) = match slots.iter().filter(|s| s.y0 <= at_y).count().checked_sub(1) {
+        None => (0, slots.first()?.y0),
+        Some(i) => {
+            let r = slots[i];
+            let over_caption = matches!(r.kind, LsSlotKind::Header { .. }) && at_y < (r.y0 + r.y1) / 2.0;
+            match (over_caption, slots.get(i + 1)) {
+                (true, _) => (i, r.y0),
+                (false, Some(next)) => (i + 1, next.y0),
+                (false, None) => (i + 1, r.y1),
+            }
+        }
+    };
+    let before = slots.iter().skip(line).find_map(|s| match &s.kind {
+        LsSlotKind::Style { id, .. } if *id != moved_id => Some(id.clone()),
+        _ => None,
+    });
+    let folder_of = |s: &LsSlot| match &s.kind {
+        LsSlotKind::Style { name, .. } => ls_folder(name),
+        LsSlotKind::Header { path } => path.clone(),
+    };
+    let into = match slots.get(line).copied() {
+        Some(s) => match &s.kind {
+            LsSlotKind::Style { name, .. } => ls_folder(name),
+            LsSlotKind::Header { .. } => match line.checked_sub(1).map(|i| slots[i]) {
+                Some(prev) => match &prev.kind {
+                    LsSlotKind::Style { name, .. } => ls_folder(name),
+                    LsSlotKind::Header { path } => path.clone(),
+                },
+                None => String::new(),
+            },
+        },
+        None => folder_of(slots.last().copied()?),
+    };
+    // 落在自己原来的位置不算移动。
+    if (line == fp || line == fp + 1) && ls_folder(&moved_name) == into {
+        return None;
+    }
+    let name = ls_moved_name(names, &moved_id, &moved_name, &into);
+    let mut q = json!({ "styles": [moved_id] });
+    if let Some(b) = before {
+        q["before"] = json!(b);
+    }
+    if name != moved_name {
+        q["name"] = json!(name);
+    }
+    Some((y, q))
+}
+
+/// Page 节「Local styles」的整个列表块（egui `style_picker::local_styles` 1:1）。
+///
+/// 不用 `field_row_full`：那是统一网格的 32 pt 行 + 右端 24 pt trailing 列，装不下上游
+/// 微调过的 24 pt 行距、8 pt 侧内缩和 8/16/16 分组间距。整个列表作为一个 free block
+/// 自己排版，才能逐项对齐 `LS_*`，也才能把拖动事件绑在一张覆盖全表的容器上。
+fn local_styles_block(f: &RightFields, d: &PanelData, window: &mut Window, cx: &mut App) -> Div {
+    let t = tokens();
+    let ui = f.local_styles_ui.clone();
+    let wake = f.cmds.clone();
+    let cmds = f.cmds.clone();
+    let folded = f.local_style_folded.clone();
+    let mut slots: Vec<LsSlot> = Vec::new();
+    let names: Vec<(String, String)> = d.styles.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+    let mut key_rows: Vec<LocalStyleKeyRow> = Vec::new();
+    let mut rows: Vec<Div> = Vec::new();
+    let mut y = 0.0;
+    let mut groups = 0usize;
+    static GROUPS: &[(&'static str, &'static str)] = &[
+        ("text", "Text styles"),
+        ("paint", "Color styles"),
+        ("effect", "Effect styles"),
+        ("grid", "Grid styles"),
+    ];
+
+    for &(ty, cap_key) in GROUPS {
+        let list: Vec<&LocalStyleRow> = d.styles.iter().filter(|s| s.ty == ty).collect();
+        if list.is_empty() {
+            continue;
+        }
+        // 组间距：第一组 8 pt，其后每组 16 pt（egui `LS_FIRST_GAP` / `LS_GROUP_GAP`）。
+        let gap = if groups == 0 { LS_FIRST_GAP } else { LS_GROUP_GAP };
+        y += gap;
+        rows.push(div().w_full().h(pt(gap)));
+        groups += 1;
+
+        // 组标题 32 pt + 该组的 `+`（直接建这种类型，egui `row_plus` 同位置）。
+        let create_params = ls_create_params(d, ty, "");
+        let cmds_c = cmds.clone();
+        let plus = IconButton::new(Icon::Plus).size(24.0).on_click(move |_anchor, _w, _cx| {
+            cmds_c.push(Cmd { id: "style.create", params: Some(create_params.clone()) });
+        });
+        rows.push(local_style_caption(SharedString::from(tr(cap_key)), plus));
+        y += LS_CAPTION_H;
+
+        let mut style_no = 0usize;
+        for line in ls_entries(&list, &|p| folded.borrow().contains(&format!("{}/{}", ty, p))) {
+            match line {
+                LsLine::Folder { path, label, depth } => {
+                    slots.push(LsSlot { ty, y0: y, y1: y + LS_FOLDER_H, kind: LsSlotKind::Header { path: path.clone() } });
+                    rows.push(local_style_folder(f, d, &label, &path, ty, depth, window, cx));
+                    y += LS_FOLDER_H;
+                }
+                LsLine::Style(idx, depth) => {
+                    let s = &list[idx];
+                    // 这一行在 `rows`（跨类型、按绘制顺序）里的下标：单击选中 / 双击改名都用它。
+                    let key_rows_len_before = key_rows.len();
+                    slots.push(LsSlot {
+                        ty,
+                        y0: y,
+                        y1: y + LS_ROW_H,
+                        kind: LsSlotKind::Style { index: style_no, id: s.id.clone(), name: s.name.clone() },
+                    });
+                    key_rows.push(LocalStyleKeyRow {
+                        y0: y,
+                        ty,
+                        id: s.id.clone(),
+                        name: s.name.clone(),
+                        description: s.description.clone(),
+                        properties: s.properties.clone(),
+                        paints: s.paints.clone(),
+                        text: s.text.clone(),
+                        effects: s.effects.clone(),
+                        grids: s.grids.clone(),
+                    });
+                    rows.push(local_style_row(f, d, s, depth, ty, style_no, key_rows_len_before, &ui, window, cx));
+                    y += LS_ROW_H;
+                    style_no += 1;
+                }
+            }
+        }
+    }
+    if groups > 0 {
+        rows.push(div().w_full().h(pt(LS_BOTTOM_PAD)));
+    }
+    {
+        let mut st = ui.borrow_mut();
+        st.slots = slots;
+        st.names = names;
+        let n = key_rows.len();
+        st.rows = key_rows;
+        // 文档改了导致行数变少时把选中项夹回范围，避免按键读到越界行。
+        st.sel = st.sel.filter(|&k| k < n);
+    }
+
+    // `track_focus` 把整张列表放进 Tab 顺序；方向键 / Enter / Delete / Ctrl+D 由根视图
+    // 的键盘链转发到 `RightFields::local_style_key`（GPUI 元素级按键只在命中元素内触发）。
+    let mut root = div().relative().w_full().flex().flex_col().track_focus(&f.local_style_focus).children(rows);
+    // 容器在窗口里的原点：prepaint 写入，下一帧的事件把指针换算成相对坐标。
+    let ui_o = ui.clone();
+    root = root.child(
+        gpui::canvas(
+            move |bounds, _, _| {
+                ui_o.borrow_mut().origin = Some((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w_full()
+        .h_full(),
+    );
+
+    // 拖动中每帧只解析落点画线，松手才提交一次 `style.move`（一个 undo step）。
+    let ui_m = ui.clone();
+    let wake_m = wake.clone();
+    root = root.on_mouse_move(move |e: &MouseMoveEvent, _w, _cx| {
+        let (slots, names, origin) = {
+            let s = ui_m.borrow();
+            (s.slots.clone(), s.names.clone(), s.origin)
+        };
+        let mut s = ui_m.borrow_mut();
+        let Some(drag) = s.drag.as_mut() else { return };
+        drag.pointer = e.position;
+        let dx = f32::from(e.position.x) - f32::from(drag.start.x);
+        let dy = f32::from(e.position.y) - f32::from(drag.start.y);
+        if !drag.armed && dx.hypot(dy) > LS_DRAG_DEADZONE {
+            drag.armed = true;
+        }
+        if drag.armed {
+            let rel = f32::from(e.position.y) - origin.map(|o| o.1).unwrap_or(0.0);
+            let made = ls_drop_move(&slots, &names, drag.ty, drag.from, rel);
+            match made {
+                Some((ly, q)) => {
+                    drag.line_y = Some(ly);
+                    drag.query = Some(q);
+                }
+                None => {
+                    drag.line_y = None;
+                    drag.query = None;
+                }
+            }
+        }
+        wake_m.wake();
+    });
+    let ui_u = ui.clone();
+    let cmds_u = cmds.clone();
+    let wake_u = wake.clone();
+    root = root.on_mouse_up(MouseButton::Left, move |_e: &MouseUpEvent, _w, _cx: &mut App| {
+        let Some(drag) = ui_u.borrow_mut().drag.take() else { return };
+        // 松手只处理「拖动排序」：没越过死区的单击在**按下**时就已经选中了这一行
+        // （`ui.sel`），双击改名也在按下时判定 —— 这里不再弹设置页
+        // （用户 2026-11-15：只有前面 / 行尾那两个 24×24 图标才弹设置）。
+        if drag.armed
+            && let Some(q) = drag.query
+        {
+            cmds_u.push(Cmd { id: "style.move", params: Some(q) });
+        }
+        wake_u.wake();
+    });
+
+    // 插入线（2 pt 强调色，左右通到 band 边缘）+ 跟随指针的名字标签（egui `drag_ghost`）。
+    {
+        let st = ui.borrow();
+        // 键盘焦点框：与行同高、左右内缩 LS_INSET，通到 band 边缘。
+        if let Some(k) = st.sel
+            && let Some(r) = st.rows.get(k)
+        {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(pt(LS_INSET))
+                    .right(pt(LS_INSET))
+                    .top(pt(r.y0))
+                    .h(pt(LS_ROW_H))
+                    .rounded(pt(5.0))
+                    .border_1()
+                    .border_color(rgba(t.accent)),
+            );
+        }
+        if let Some(drag) = st.drag.as_ref().filter(|d| d.armed) {
+            if let Some(ly) = drag.line_y {
+                root = root.child(
+                    div().absolute().left(pt(LS_INSET)).right(pt(LS_INSET)).top(pt(ly - 1.0)).h(pt(2.0)).bg(rgba(t.accent)),
+                );
+            }
+            let (ox, oy) = st.origin.unwrap_or((0.0, 0.0));
+            let gx = f32::from(drag.pointer.x) - ox + 14.0;
+            let gy = f32::from(drag.pointer.y) - oy + 10.0;
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(pt(gx))
+                    .top(pt(gy))
+                    .px(pt(8.0))
+                    .py(pt(4.0))
+                    .bg(rgba(t.panel))
+                    .border_1()
+                    .border_color(rgba(t.accent))
+                    .rounded(pt(5.0))
+                    .child(div().child(drag.label.clone()).text_size(pt(11.0)).text_color(rgba(t.text))),
+            );
+        }
+    }
+    root
+}
+
 /// 样式名的「叶子」部分（去掉 "Brand/" 前缀），egui 的 `leaf(&s.name)`。
 fn leaf_name(name: &str) -> SharedString {
     SharedString::from(name.rsplit('/').next().unwrap_or(name).to_string())
@@ -2616,21 +3025,20 @@ fn ls_flatten(nodes: &[LsBranch], node: usize, depth: usize, folded: &dyn Fn(&st
 }
 
 /// 类型分组的标题行（egui `local_styles` 的 caption：32 pt、类型名 + 右侧 `+`）。
-fn local_style_caption(title: SharedString, plus: IconButton) -> FieldRow {
+fn local_style_caption(title: SharedString, plus: IconButton) -> Div {
     let t = tokens();
-    let body = div()
+    // egui `allocate_exact_size(vec2(w, LS_CAPTION_H))` + 文字在 `caption.min.x + LS_PAD`。
+    div()
         .w_full()
-        .h_full()
+        .h(pt(LS_CAPTION_H))
         .flex()
         .flex_row()
         .items_center()
-        .gap(pt(8.0))
-        .pl(pt(8.0))
-        .pr(pt(8.0))
-        .child(div().text_size(pt(11.0)).font_weight(gpui::FontWeight::MEDIUM).text_color(rgba(t.text_secondary)).child(title))
+        .pl(pt(LS_PAD))
+        .pr(pt(LS_INSET))
+        .child(div().text_size(pt(11.0)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgba(t.text_secondary)).child(title))
         .child(div().flex_1().min_w(px(0.0)))
-        .child(plus);
-    field_row_full(body)
+        .child(plus)
 }
 
 /// 文件夹头行（egui `local_styles` 的 Folder 行：chevron + 文件夹名，按层级缩进）。
@@ -2647,7 +3055,7 @@ fn local_style_folder(
     depth: usize,
     window: &mut Window,
     cx: &mut App,
-) -> FieldRow {
+) -> Div {
     let t = tokens();
     // 是否正在重命名这个文件夹（egui `renaming.as_deref() == Some(path)`）。
     // 按 **type + path** 匹配：text 与 paint 可以各有 `Brand/Colors`，只比 path 会让两行同时
@@ -2693,8 +3101,21 @@ fn local_style_folder(
     let wake = f.cmds.clone();
 
     // 名称区：重命名时换成内联输入框；否则 chevron + 文件夹名，并挂折叠/右键菜单。
+    // 图标起点 = band 左边 + (LS_PAD - LS_INSET) + depth * LS_STEP；行尾给 16 pt `+`
+    // 留 LS_ICON + LS_ICON_GAP，名字不会被压到按钮下面（egui `text_r`）。
+    // lizard `local_styles`：文件夹行缩进只有 0 / 12（`if f.is_empty() { 0.0 } else { 12.0 }`）。
+    let name_inset = LS_PAD - LS_INSET + if depth == 0 { 0.0 } else { 12.0 };
     let name_area = if is_renaming {
-        div().w_full().h_full().flex().flex_row().items_center().gap(pt(8.0)).pl(pt(24.0 * depth as f32)).pr(pt(8.0)).child(rename_input)
+        div()
+            .w_full()
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(pt(LS_ICON_GAP))
+            .pl(pt(name_inset))
+            .pr(pt(LS_ICON + LS_ICON_GAP))
+            .child(rename_input)
     } else {
         let chevron = if open { Icon::ChevronDown } else { Icon::ChevronRight };
         div()
@@ -2703,9 +3124,9 @@ fn local_style_folder(
             .flex()
             .flex_row()
             .items_center()
-            .gap(pt(8.0))
-            .pl(pt(24.0 * depth as f32))
-            .pr(pt(8.0))
+            .gap(pt(LS_ICON_GAP))
+            .pl(pt(name_inset))
+            .pr(pt(LS_ICON + LS_ICON_GAP))
             .cursor_pointer()
             // ① 左键整行切换折叠（egui `resp.clicked()`）。
             .on_mouse_down(MouseButton::Left, {
@@ -2771,26 +3192,45 @@ fn local_style_folder(
                     });
                 }
             })
-            .child(crate::widgets::icon::paint(chevron, rgba(t.text_secondary), 12.0))
+            .child(
+                div()
+                    .flex_none()
+                    .size(pt(LS_ICON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(crate::widgets::icon::paint(chevron, rgba(t.text_secondary), LS_CHEVRON)),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
                     .text_size(pt(11.0))
-                    .text_color(rgba(t.text_secondary))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgba(t.text))
                     .child(SharedString::from(label.to_string())),
             )
     };
 
-    field_row_full(
-        div()
-            .w_full()
-            .h_full()
-            .rounded(pt(5.0))
-            .hover(|s| s.bg(rgba(t.hover)))
-            .child(div().w_full().h_full().flex().flex_row().items_center().gap(pt(4.0)).child(name_area).child(plus)),
-    )
+    // lizard `local_styles`：文件夹行 `allocate_exact_size(vec2(w, 24.0))`，
+    // 左右各内缩 8 pt，hover band 圆角 5。
+    div()
+        .relative()
+        .w_full()
+        .h(pt(LS_FOLDER_H))
+        .px(pt(LS_INSET))
+        .child(
+            div()
+                .w_full()
+                .h_full()
+                .rounded(pt(5.0))
+                .hover(|s| s.bg(rgba(t.hover)))
+                .child(name_area)
+                .child(
+                    div().absolute().right(pt(LS_INSET)).top_0().h_full().flex().items_center().child(plus),
+                ),
+        )
 }
 
 /// 文件夹 `+` 新建样式所用的默认名（egui `StyleSlot::default_name`）。
@@ -2819,6 +3259,36 @@ fn ls_create_params(d: &PanelData, ty: &str, folder: &str) -> Value {
         _ => json!("#000000"),
     };
     json!({ "type": ty, "name": name, "value": value })
+}
+
+/// 一条样式行快照 → `style.create` 的 `value`（各类型的**整值**，与 `style.update` 同构）。
+///
+/// `Ctrl/Cmd+C` 复制、`Ctrl/Cmd+V` 粘贴要带着值走：新样式必须有内容，不能只留一个空壳名字。
+/// 各类型的键与引擎 `style.create` 的解析一一对应：paint = paints 数组、text = TextStyle 对象、
+/// effect = effects 数组、grid = grids 数组。
+pub(crate) fn ls_style_value(r: &LocalStyleKeyRow) -> Value {
+    match r.ty {
+        "paint" => serde_json::to_value(&r.paints).unwrap_or_else(|_| json!([])),
+        "text" => r.text.clone().unwrap_or_else(|| json!({})),
+        "effect" => Value::Array(r.effects.as_ref().map(|e| e.iter().map(|x| x.effect.clone()).collect()).unwrap_or_default()),
+        // `GridRow.grids` 存的就是**整个** grids 数组，取第一行即可，不要重复拼。
+        _ => r.grids.as_ref().and_then(|g| g.first()).map(|x| x.grids.clone()).unwrap_or_else(|| json!([])),
+    }
+}
+
+/// 粘贴出来的样式名：`<leaf> copy`，重名则 ` copy 2 / copy 3 …`（同 `style.duplicate` 的语义），
+/// 并保留原来的文件夹前缀。
+pub(crate) fn ls_paste_name(names: &[(String, String)], src: &str) -> String {
+    let folder = ls_folder(src);
+    let leaf = src.rsplit('/').next().unwrap_or(src);
+    let named = |l: &str| if folder.is_empty() { l.to_string() } else { format!("{folder}/{l}") };
+    let base = format!("{leaf} copy");
+    let first = named(&base);
+    let taken = |n: &str| names.iter().any(|(_, x)| x == n);
+    if !taken(&first) {
+        return first;
+    }
+    (2..).map(|k| named(&format!("{base} {k}"))).find(|n| !taken(n)).unwrap_or(first)
 }
 
 /// 类型分组标题栏的 `+`：弹出「建哪种样式」菜单（egui `local_styles` 的头部 `+`）。
@@ -2864,36 +3334,113 @@ fn local_styles_add_button(f: &RightFields, d: &PanelData) -> IconButton {
 /// 整行悬停高亮（圆角 t.hover 块，与行同高、内缩 8px）、左键把样式应用到选区、右键 Duplicate / Delete；
 /// 文件夹层级用 `depth * 24px` 缩进（egui `LS_STEP`）。
 ///
-/// `_d` 已不参与渲染（原先只为「Edit style」占位建同类型样式列表；那个动作已按 CodeRabbit 的
-/// 建议移除，等真正的 `edit_local` 编辑器落地再补），保留参数是为了调用处稳定。
-fn local_style_row(f: &RightFields, _d: &PanelData, s: &LocalStyleRow, depth: usize, ty: &'static str) -> FieldRow {
+/// `d` 只用来算「改名时的位置锚点」（`style.move` 的 `before`），不再参与渲染。
+fn local_style_row(
+    f: &RightFields,
+    d: &PanelData,
+    s: &LocalStyleRow,
+    depth: usize,
+    ty: &'static str,
+    style_no: usize,
+    // 这一行在 `LocalStyleUi.rows`（跨类型、按绘制顺序）里的下标：单击选中 / 双击改名都用它。
+    flat: usize,
+    ui: &Rc<RefCell<LocalStyleUi>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
     let t = tokens();
     let cmds = f.cmds.clone();
     let sid = s.id.clone();
     let name = leaf_name(&s.name);
+    // 改名提交 `style.move {name}`：不带 `before` 时引擎会把样式挪到列表**末尾**，列表顺序会跳。
+    // 取「同类型里紧跟其后的那个样式」当锚点，改完名字位置不变。
+    let rename_before: Option<String> = {
+        let same: Vec<&LocalStyleRow> = d.styles.iter().filter(|x| x.ty == ty).collect();
+        same.iter().position(|x| x.id == s.id).and_then(|i| same.get(i + 1)).map(|x| x.id.clone())
+    };
+    // 双击改名的内联输入框状态（与文件夹改名共用同一个控件实体）。
+    let mut is_renaming = f.local_style_rename_style.borrow().as_ref().is_some_and(|k| k.0 == ty && k.1 == s.id);
+    // 编辑结束（Enter 提交 / Esc / 失焦）时收掉改名态。`TextEdit::on_commit` 只在**值变了**才
+    // 回调，Esc 与「没改就走」都不会回调，所以用「曾经激活过」守卫，与文件夹改名同一套。
+    if is_renaming {
+        let active = f.local_style_rename_input.read(cx).edit().read(cx).is_active(window);
+        let mut seen = f.local_style_rename_seen.borrow_mut();
+        if active {
+            *seen = true;
+        } else if *seen {
+            drop(seen);
+            f.local_style_rename_style.borrow_mut().take();
+            *f.local_style_rename_seen.borrow_mut() = false;
+            is_renaming = false;
+        }
+    }
+    // 打开这个样式的设置页：前面 24×24 图标、行尾 24×24 设置按钮、右键「Edit style」三处共用。
+    let edit_title = SharedString::from(match ty {
+        "paint" => tr("Edit color style"),
+        "text" => tr("Edit text style"),
+        "effect" => tr("Edit effect style"),
+        _ => tr("Edit grid style"),
+    });
+    let open_editor: Rc<dyn Fn(&mut Window, &mut App)> = {
+        let popups = f.popups();
+        let cmds = cmds.clone();
+        let title = edit_title.clone();
+        let (id, full, desc) = (s.id.clone(), s.name.clone(), s.description.clone());
+        let props = s.properties.clone();
+        let ps = s.paints.clone();
+        let stext = s.text.clone();
+        let seff = s.effects.clone();
+        let sgrid = s.grids.clone();
+        Rc::new(move |window: &mut Window, cx: &mut App| {
+            popups.request(crate::popovers::WindowState::style_editor(
+                cmds.clone(),
+                cx,
+                window.mouse_position(),
+                title.clone(),
+                ty,
+                id.clone(),
+                full.clone(),
+                desc.clone(),
+                props.clone(),
+                ps.clone(),
+                stext.clone(),
+                seff.clone(),
+                sgrid.clone(),
+                popups.clone(),
+            ));
+        })
+    };
     // 左侧徽标（egui `paint_dot` / "Ag" / `slot.icon()`）。
     let badge: gpui::AnyElement = match &s.paint {
-        Some(p) => div().flex_none().size(pt(16.0)).rounded_full().overflow_hidden().child(swatch(p.clone(), 16.0)).into_any_element(),
+        // egui `paint_dot`: circle_filled(c, 8) + circle_stroke(c, 7.5, 1pt, t.border)。
+        Some(p) => div()
+            .flex_none()
+            .size(pt(LS_ICON))
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(t.border))
+            .overflow_hidden()
+            .child(swatch(p.clone(), LS_ICON))
+            .into_any_element(),
         None if ty == "text" => div()
             .flex_none()
+            .size(pt(LS_ICON))
             .flex()
             .items_center()
             .justify_center()
-            .min_w(pt(16.0))
-            .text_size(pt(11.0))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_size(pt(9.0))
             .text_color(rgba(t.text))
-            .child("Ag")
+            .child("Aa")
             .into_any_element(),
         None => {
             let icon = match ty {
-                "effect" => Icon::Star,
+                "effect" => Icon::Rectangle,
                 "grid" => Icon::ViewGrid,
                 _ => Icon::Text,
             };
             div()
                 .flex_none()
-                .size(pt(16.0))
+                .size(pt(LS_ICON))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2901,6 +3448,27 @@ fn local_style_row(f: &RightFields, _d: &PanelData, s: &LocalStyleRow, depth: us
                 .into_any_element()
         }
     };
+    // 前面的 **24×24 图标命中区**：点它才弹出这个样式的设置页（用户 2026-11-15）。
+    // 图标本身还是 16 pt，命中区放大到 24×24；左右各 -4 的外边距让图标位置与名字间距
+    // 和改动前逐像素一致，不因为命中区变大把名字推右。
+    let badge_hit = div()
+        .flex_none()
+        .ml(px(-4.0))
+        .mr(px(-4.0))
+        .size(pt(LS_ICON_HIT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, {
+            let open = open_editor.clone();
+            move |_e, window, cx: &mut App| {
+                // 不要再冒泡到整行的「选中 / 拖动」。
+                cx.stop_propagation();
+                open(window, cx);
+            }
+        })
+        .child(badge);
     // 整行内容：层级缩进 + 8px 内缩，悬停高亮。
     let mut body = div()
         .w_full()
@@ -2908,41 +3476,112 @@ fn local_style_row(f: &RightFields, _d: &PanelData, s: &LocalStyleRow, depth: us
         .flex()
         .flex_row()
         .items_center()
-        .gap(pt(8.0))
-        .pl(pt(24.0 * depth as f32))
-        .pr(pt(8.0))
+        .gap(pt(LS_ICON_GAP))
+        // lizard `local_styles`：`x = r.min.x + PAD + indent + 1`，图标 16×16 中心在 `x + 8`，
+        // 名字从 `x + 24`；`indent` 只有 0 / 12（文件夹内）。band 左内缩 8，故 pl = x - 8。
+        .pl(pt(LS_PAD - LS_INSET + 1.0 + if depth == 0 { 0.0 } else { 12.0 }))
+        // lizard `name_w = r.max.x - PAD - 32 - name_x`；band 右缘已内缩 8，故 pr = 40。
+        .pr(pt(40.0))
         .cursor_pointer()
+        // 左键：① 选中这一行（单击）；② 记拖动起点，越过死区才改成排序拖动；
+        // ③ 400ms 内在同一行再按 = 双击改名。**不再**弹设置页——那是前面 / 行尾两个图标的事。
         .on_mouse_down(MouseButton::Left, {
-            let cmds = cmds.clone();
-            let sid = sid.clone();
-            move |_e, _w, _cx| {
-                cmds.push(Cmd { id: "style.apply", params: Some(json!({ "style": sid })) });
+            let ui = ui.clone();
+            let wake = f.cmds.clone();
+            let id = sid.clone();
+            let label = leaf_name(&s.name).to_string();
+            let full_name = s.name.clone();
+            let description = s.description.clone();
+            let properties = s.properties.clone();
+            let paints = s.paints.clone();
+            let text = s.text.clone();
+            let effects = s.effects.clone();
+            let grids = s.grids.clone();
+            let renaming = f.local_style_rename_style.clone();
+            let rename_input = f.local_style_rename_input.clone();
+            let seen = f.local_style_rename_seen.clone();
+            let focus = f.local_style_focus.clone();
+            let folder = ls_folder(&s.name);
+            move |e: &MouseDownEvent, window, cx: &mut App| {
+                // 键盘操作（↑↓ / Enter / Delete / Ctrl+D / Ctrl+C / Ctrl+V）都挂在列表的焦点上：
+                // 点行即把焦点交给列表，选完立刻就能用键盘，不用先按一次 Tab。
+                window.focus(&focus);
+                ui.borrow_mut().drag = Some(LocalStyleDrag {
+                    ty,
+                    from: style_no,
+                    id: id.clone(),
+                    label: label.clone(),
+                    name: full_name.clone(),
+                    description: description.clone(),
+                    properties: properties.clone(),
+                    paints: paints.clone(),
+                    text: text.clone(),
+                    effects: effects.clone(),
+                    grids: grids.clone(),
+                    start: e.position,
+                    pointer: e.position,
+                    armed: false,
+                    line_y: None,
+                    query: None,
+                });
+                // 选中 + 双击判定（同一行、400ms 内）。
+                let dbl = {
+                    let mut st = ui.borrow_mut();
+                    st.sel = Some(flat);
+                    let now = std::time::Instant::now();
+                    let same = st.last_click.as_ref().is_some_and(|(k, at)| *k == id && now.duration_since(*at) < LS_DOUBLE_CLICK);
+                    st.last_click = if same { None } else { Some((id.clone(), now)) };
+                    same
+                };
+                if dbl {
+                    // 双击：进入内联改名。先写值再进编辑态（`set_value` 在编辑中会保留草稿）。
+                    renaming.borrow_mut().replace((ty.to_string(), id.clone(), folder.clone(), rename_before.clone()));
+                    *seen.borrow_mut() = false;
+                    let edit = rename_input.read(cx).edit();
+                    edit.update(cx, |te, _cx| {
+                        te.set_value(label.clone());
+                        te.focus_editor(window);
+                    });
+                }
+                wake.wake();
             }
         })
-        .child(badge);
+        .child(badge_hit);
     // 名字占满中间，文本样式的 "32/Auto" 贴行尾（egui 的 meta 右对齐在 `r.max.x - LS_TRAIL`）。
-    body = body.child(div().flex_1().min_w(px(0.0)).overflow_hidden().text_size(pt(11.0)).text_color(rgba(t.text)).child(name));
-    if let Some(meta) = &s.text_meta {
-        body = body.child(div().flex_none().text_size(pt(11.0)).text_color(rgba(t.text_tertiary)).child(meta.clone()));
-    }
-    // 右键：Duplicate / Delete（egui `context_popup`）。
-    //
-    // egui 的第一项是「Edit style」→ `edit_local` 样式编辑器（名称 / 描述 / 值）。GPUI 还没有
-    // 那个编辑器，之前用「同类型样式列表 + `style.apply`」占位，但这既名不副实（点下去是应用
-    // 不是编辑），在 Local styles 页（无选区）也毫无作用——`style.apply` 没有目标。故先移除，
-    // 等 `edit_local` 落地再补回（CodeRabbit 指出，勿再用 apply 列表冒充编辑器）。
+    // 双击改名期间名字位换成内联输入框（与文件夹改名共用同一个控件实体）。
+    body = if is_renaming {
+        body.child(div().flex_1().min_w(px(0.0)).child(f.local_style_rename_input.clone()))
+    } else {
+        let b = body.child(div().flex_1().min_w(px(0.0)).overflow_hidden().text_size(pt(11.0)).text_color(rgba(t.text)).child(name));
+        match &s.text_meta {
+            Some(meta) => b.child(
+                div().flex_none().pl(pt(5.0)).text_size(pt(10.0)).text_color(rgba(t.text_secondary)).child(SharedString::from(format!("· {meta}"))),
+            ),
+            None => b,
+        }
+    };
+    // 右键：Edit style / Duplicate / Delete（egui `context_popup` 1:1）。
+    // 「Edit style」与前面 / 行尾两个图标同一个入口，都打开样式编辑器弹窗。
     let cmds_r = cmds.clone();
     let root = f.root.clone();
+    let edit_label: String = tr("Edit style").to_string();
     let dup_label: String = tr("Duplicate").to_string();
     let del_label: String = tr("Delete").to_string();
+    let open_editor_r = open_editor.clone();
     body = body.on_mouse_down(MouseButton::Right, move |e: &gpui::MouseDownEvent, _w, cx: &mut App| {
+        // `on_mouse_down` 是 `Fn`（可多次触发），捕获值不能移出去，先逐项 clone。
         let cmds_r = cmds_r.clone();
         let sid = sid.clone();
-        // `on_mouse_down` 的监听是 `Fn`（可多次触发），不能把捕获的 String 移出去，
-        // 每次调用先克隆成本地变量再 move 进菜单回调。
+        let open_editor = open_editor_r.clone();
+        let edit = edit_label.clone();
         let dup = dup_label.clone();
         let del = del_label.clone();
-        let rows = vec![MenuRow::new(dup.clone()), MenuRow::new(del.clone())];
+        let dup_trail = if cfg!(target_os = "windows") { "Ctrl+D" } else { "⌘D" };
+        let rows = vec![
+            MenuRow::new(edit.clone()),
+            MenuRow::new(dup.clone()).trail(dup_trail),
+            MenuRow::new(del.clone()).trail("Del"),
+        ];
         let Some(root) = root.clone() else { return };
         let anchor = gpui::Bounds::new(e.position, gpui::size(px(0.0), px(0.0)));
         root.update(cx, move |cv, cx| {
@@ -2950,7 +3589,11 @@ fn local_style_row(f: &RightFields, _d: &PanelData, s: &LocalStyleRow, depth: us
                 anchor,
                 Some(160.0),
                 rows,
-                Rc::new(move |label: &str, _window, _cx| {
+                Rc::new(move |label: &str, window, cx| {
+                    if edit == label {
+                        open_editor(window, cx);
+                        return;
+                    }
                     let id = if dup == label {
                         "style.duplicate"
                     } else if del == label {
@@ -2964,8 +3607,25 @@ fn local_style_row(f: &RightFields, _d: &PanelData, s: &LocalStyleRow, depth: us
             );
         });
     });
-    // 悬停高亮整行（egui `rect_filled(r, CornerRadius::same(5), t.hover)`）。
-    field_row_full(div().w_full().h_full().rounded(pt(5.0)).hover(|s| s.bg(rgba(t.hover))).child(body))
+    // 整行左右各内缩 LS_INSET、24 pt 高，hover band 圆角 5（egui `inset_row` + `rect_filled`）。
+    div()
+        .relative()
+        .w_full()
+        .h(pt(LS_ROW_H))
+        .px(pt(LS_INSET))
+        // lizard `r.shrink2(vec2(8.0, 2.0))`：hover 带左右 8、上下 2。
+        .py(pt(2.0))
+        .child(div().w_full().h_full().rounded(pt(5.0)).hover(|s| s.bg(rgba(t.hover))).child(body))
+        // lizard `local_styles`：行尾 24×24 的设置按钮（`r.max.x - 32`），点开编辑器。
+        // 它和前面的 24×24 图标是**唯一**两个会弹出设置页的命中区（双击名字进入改名）。
+        .child({
+            let open = open_editor.clone();
+            div().absolute().right(pt(0.0)).top(pt(2.0)).h(pt(LS_ROW_H - 4.0)).flex().items_center().child(
+                IconButton::new(Icon::Settings).size(24.0).on_click(move |_e, window, cx| {
+                    open(window, cx);
+                }),
+            )
+        })
 }
 
 /// 空选区时的右栏：**两个独立小节**，各自一个 40 pt 标题：
@@ -3030,48 +3690,70 @@ pub(crate) fn page(f: &RightFields, d: &PanelData, row_w: f32, n: &mut usize, wi
     sec = sec.child(field_row_full(pick_dropdown(f, p.profile.clone(), row_w, profiles)));
     let mut out = vec![sec];
 
-    // ── ② Local styles（egui `style_picker::local_styles`）：按 Text / Color / Effect / Grid
-    //       分成四组，每组一个小标题（带 `+`） + 该类型的样式行（含文件夹树）；空文档只有置灰标题。──
-    let mut styles_sec = PanelSection::new(tr("Local styles"))
-        .variant(if p.local_styles == 0 { SectionHeaderVariant::Dim } else { SectionHeaderVariant::Normal })
-        .header_trail(icon_row(vec![local_styles_add_button(f, d)]));
+    // ── ② Local styles（egui `style_picker::local_styles`）──────────────────────────────────
+    // 整张列表作为一个 free block：24 pt 行、8/16/16 分组间距、圆形色板、整行拖动排序
+    // 都由 `local_styles_block` 按 `LS_*` 自己排版，不套统一网格的 32 pt 行 / 24 pt trailing 列。
     // 分组顺序与 egui `StyleSlot` 一致：Text / Fill(Color) / Effect / Grid。
-    let groups: &[(&str, &str, &str)] = &[
-        ("text", "Text styles", "Text"),
-        ("paint", "Color styles", "Color"),
-        ("effect", "Effect styles", "Effect"),
-        ("grid", "Grid styles", "Grid"),
-    ];
-    for (ty, cap_key, _dname) in groups {
-        let list: Vec<&LocalStyleRow> = d.styles.iter().filter(|s| s.ty == *ty).collect();
-        if list.is_empty() {
-            continue;
-        }
-        // 每组的小标题 + 该组的 `+`（直接建这种类型的样式；egui 同位置的 `+` 也是这个行为）。
-        let cmds = f.cmds.clone();
-        // 组标题的 `+` 同样走 `ls_create_params`：Local styles 页没有选区，必须自带 `value`，
-        // 否则 `style.create` 会以 "pass `value` or select a layer" 失败、`+` 看着没反应。
-        let create_params = ls_create_params(d, ty, "");
-        let plus = IconButton::new(Icon::Plus).size(16.0).on_click(move |_anchor, _w, _cx| {
-            cmds.push(Cmd { id: "style.create", params: Some(create_params.clone()) });
-        });
-        styles_sec = styles_sec.child(local_style_caption(SharedString::from(tr(cap_key)), plus));
-        // 文件夹树（本遍展开全部）：先文件夹头、后其下样式、再递归子文件夹。
-        let ls_folded = f.local_style_folded.clone();
-        for line in ls_entries(&list, &|p| ls_folded.borrow().contains(&format!("{}/{}", *ty, p))) {
-            match line {
-                LsLine::Folder { path, label, depth } => {
-                    styles_sec = styles_sec.child(local_style_folder(f, d, &label, &path, *ty, depth, window, cx))
-                }
-                LsLine::Style(idx, depth) => {
-                    let s = &list[idx];
-                    styles_sec = styles_sec.child(local_style_row(f, d, s, depth, *ty));
-                }
-            }
-        }
-    }
+    let styles_sec = PanelSection::new(tr("Styles"))
+        .variant(if p.local_styles == 0 { SectionHeaderVariant::Dim } else { SectionHeaderVariant::Normal })
+        .header_trail(icon_row(vec![local_styles_add_button(f, d)]))
+        .child(block_row(local_styles_block(f, d, window, cx)));
     out.push(styles_sec);
     out
+}
+
+#[cfg(test)]
+mod local_styles_1to1_tests {
+    use super::*;
+
+    /// 上游 `ui-egui/src/widgets/style_picker.rs` 45-67 行逐项微调过的布局参数。
+    /// 这一版是「唯一正确的版本」，任何一项都不许再凭感觉改回去。
+    #[test]
+    fn ls_layout_constants_match_the_egui_reference() {
+        assert_eq!(LS_INSET, 8.0);
+        assert_eq!(LS_PAD, 16.0);
+        assert_eq!(LS_CAPTION_H, 32.0);
+        assert_eq!(LS_ROW_H, 24.0);
+        assert_eq!(LS_ICON, 16.0);
+        assert_eq!(LS_ICON_GAP, 8.0);
+        assert_eq!(LS_STEP, 24.0);
+        assert_eq!(LS_CHEVRON, 12.0);
+        assert_eq!(LS_FIRST_GAP, 8.0);
+        assert_eq!(LS_GROUP_GAP, 16.0);
+        assert_eq!(LS_BOTTOM_PAD, 16.0);
+        assert_eq!(LS_TRAIL, 8.0);
+    }
+
+    fn style(index: usize, id: &str, name: &str, y: f32) -> LsSlot {
+        LsSlot { ty: "paint", y0: y, y1: y + LS_ROW_H, kind: LsSlotKind::Style { index, id: id.into(), name: name.into() } }
+    }
+
+    /// egui `drop_move`：给出 `before`、跨文件夹时改名、落在原位不动、重名时编号。
+    #[test]
+    fn ls_drop_move_resolves_before_folder_and_noop() {
+        let slots = vec![style(0, "a", "Red", 32.0), style(1, "b", "Brand/Blue", 56.0), style(2, "c", "Brand/Green", 80.0)];
+        let names: Vec<(String, String)> = slots
+            .iter()
+            .map(|s| match &s.kind {
+                LsSlotKind::Style { id, name, .. } => (id.clone(), name.clone()),
+                _ => unreachable!(),
+            })
+            .collect();
+        // 停在 b 的上沿之前：插入线画在 b 的上沿，before=b；落点行的文件夹是 Brand，
+        // 于是根目录的 "Red" 要改名成 "Brand/Red"。
+        let (y, q) = ls_drop_move(&slots, &names, "paint", 0, 55.0).unwrap();
+        assert_eq!(y, 56.0);
+        assert_eq!(q["styles"][0], "a");
+        assert_eq!(q["before"], "b");
+        assert_eq!(q["name"], "Brand/Red");
+        // 落在自己原来的缝里（第一个槽之上）是空操作，不画线也不发命令。
+        assert!(ls_drop_move(&slots, &names, "paint", 0, 30.0).is_none());
+        // 目标文件夹里已有同名样式时编号，不会留下两个 "Brand/Red"。
+        let mut taken = names.clone();
+        taken.push(("x".into(), "Brand/Red".into()));
+        let (_, q) = ls_drop_move(&slots, &taken, "paint", 0, 55.0).unwrap();
+        assert_eq!(q["name"], "Brand/Red 2");
+    }
 }
 
 #[cfg(test)]
@@ -3092,6 +3774,11 @@ mod view_menu_tests {
             paint: None,
             text_meta: None,
             description: String::new(),
+            properties: Vec::new(),
+            paints: Vec::new(),
+            text: None,
+            effects: None,
+            grids: None,
         });
         // paint：纯黑；名字避开已有的 "Color 1"。
         let p = ls_create_params(&d, "paint", "");
