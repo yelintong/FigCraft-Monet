@@ -220,11 +220,12 @@ const DOUBLE_CLICK_MS: u64 = 400;
 
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
 
-/// Actions 面板的尺寸（`ui-egui/src/menus/palette.rs` 的卡片宽 320）。
+/// Actions 面板的高度。**宽度不写死**：与工具栏同宽（用户 2026-11-16），每帧按 `toolbar::width` 算。
 
-const PALETTE_W: f32 = 320.0;
+const PALETTE_H: f32 = 450.0;
 
-const PALETTE_H: f32 = 380.0;
+/// 动作库每行的行高（egui `draw_row` 的 34 pt；菜单卡默认 24 太挤）。
+const PALETTE_ROW_H: f32 = 34.0;
 
 /// 主菜单的目录、几何与外观都在 `main_menu` 模块里（照 `ui-egui/src/menus/tree.rs`）。
 
@@ -6494,19 +6495,22 @@ impl Render for CanvasView {
                     ));
                 }
 
-                Popup::Flyout { items, .. } => {
-                    // 工具组的向上弹出菜单：宽度**等于工具栏宽度**、左边与工具栏左缘对齐
-                    // （用户 2026-11-16）。原来的做法是贴着 caret 按内容宽铺开，行宽和工具栏
-                    // 对不齐；现在整张卡与 pill 同宽，行内 `w_full` 直接铺满。
-                    // 几何每帧按当前画布尺寸重算，窗口缩放 / 面板变化时跟随居中的 pill。
+                Popup::Flyout { key, items } => {
+                    // 工具组的向上弹出菜单：**宽度按内容**（`Width::Fit`），左边与工具格右侧的
+                    // caret 对齐——这是工具组自己的菜单，不跟工具栏同宽（用户 2026-11-16 澄清：
+                    // 「与工具栏同宽」说的是**动作库搜索面板**，不是这里的工具组飞出）。
 
                     let pill_left = canvas_left + (canvas_w - bar_w) / 2.0;
+
+                    let caret = toolbar::caret_left(toolbar::groups(board), *key, board, self.draw_mode).unwrap_or(0.0);
+
+                    let left = pill_left + caret;
 
                     let bottom = pill_top + toolbar::CELL_TOP - toolbar::FLYOUT_GAP;
 
                     let h = menu_card::height(items, toolbar::FLYOUT_ROW_H);
 
-                    let x = pill_left.max(m);
+                    let x = left.max(m);
 
                     let y = (bottom - h).max(m);
 
@@ -6523,7 +6527,7 @@ impl Render for CanvasView {
                     els.push(menu_card::card(
                         x,
                         y,
-                        menu_card::Width::Min(bar_w),
+                        menu_card::Width::Fit,
                         toolbar::FLYOUT_ROW_H,
                         items,
                         None,
@@ -6645,20 +6649,26 @@ impl Render for CanvasView {
                     els.push(div().absolute().left(px(x)).top(px(y)).child(card).into_any_element());
                 }
 
-                Popup::Palette { at } => {
-                    let w = PALETTE_W;
+                Popup::Palette { .. } => {
+                    // 动作库（带搜索）面板：Figma 里它**与工具栏同宽**、紧贴工具栏上方并左右对齐
+                    // （用户 2026-11-16 指的就是这个窗口）。宽度随当前工具栏变化，不写死 320。
+                    let w = bar_w;
 
                     let h = PALETTE_H;
 
                     // Recompute from the *current* pill position so the palette follows on resize.
 
-                    let left = (f32::from(at.x) - PALETTE_W / 2.0).max(8.0);
+                    let left = (canvas_left + (canvas_w - bar_w) / 2.0).max(m);
 
                     let bottom = pill_top - 8.0;
 
                     let x = left.min((vw - w - m).max(m)).max(m);
 
                     let y = (bottom - h).max(m);
+
+                    // 卡片内容宽 = 工具栏宽 − 两侧 8pt 内边距；搜索框再减去自身 8pt 内边距
+                    // （egui `desired_width(inner - 16)`），否则右侧会空出一截。
+                    let palette_inner_w = w - 32.0;
 
                     let t = widgets::tokens();
 
@@ -6674,7 +6684,7 @@ impl Render for CanvasView {
 
                     let (pal_rows, _pal_subs) = menu_card::rows(
                         &palette_items,
-                        context_menu::ROW_H,
+                        PALETTE_ROW_H,
                         false,
                         None,
                         palette_sel,
@@ -6739,6 +6749,8 @@ impl Render for CanvasView {
                         }))
                     };
 
+                    // 搜索框铺满卡片内容宽（卡片宽度随工具栏变化，固定 288 会留一截空白）。
+                    self.palette_field.update(cx, |tf, _| tf.set_width(palette_inner_w));
                     els.push(
                         div()
                             .absolute()
@@ -6750,10 +6762,16 @@ impl Render for CanvasView {
                             .flex_col()
                             .gap(widgets::pt(8.0))
                             .p(widgets::pt(8.0))
-                            .bg(widgets::rgba(t.menu))
+                            .bg(widgets::rgba(t.panel))
                             .rounded(widgets::pt(13.0))
                             .border_1()
                             .border_color(widgets::rgba(t.border))
+                            .shadow(vec![gpui::BoxShadow {
+                                color: widgets::rgba(t.shadow).into(),
+                                offset: gpui::point(px(0.0), px(8.0)),
+                                blur_radius: px(32.0),
+                                spread_radius: px(0.0),
+                            }])
                             .occlude()
                             .child(palette_field.clone())
                             .child(tabs)

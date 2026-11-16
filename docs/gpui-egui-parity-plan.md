@@ -1211,8 +1211,9 @@ C2、C3（文案规范待全面对齐）。
 - **缺失字体窗**（A13）：`text.missingFonts` 现在把 `families` 随 UI 请求带给前端；`Kind::MissingFonts`
   改成说明 + 逐族行（族名 / 使用层数 / 有来源的族给 `font.download` 按钮）+ Close，空清单显示
   「全部已安装」。
-- **工具组飞出**：`Popup::Flyout` 的卡片宽度改为工具栏宽度（`toolbar::width`），左边与 pill 左缘
-  对齐；行内 `w_full` 铺满整宽。
+- **动作库面板**（工具组飞出之外的那个）：宽度改成**与工具栏同宽**、与 pill 左右对齐、紧贴工具栏
+  上方，行高 34、内容宽 = 工具栏宽 − 16、底色 `t.panel` 并带 8/32 阴影（对齐 egui
+  `menus/palette.rs`）。工具组的向上菜单仍按内容宽并贴 caret，不与工具栏同宽。
 
 
 
