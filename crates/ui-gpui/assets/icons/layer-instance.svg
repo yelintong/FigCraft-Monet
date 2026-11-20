@@ -3,5 +3,5 @@
 <rect fill="white" x="2" y="2" width="12" height="12"/>
 <path d="M3 8L8 3L13 8L8 13L3 8Z"/>
 </mask>
-<path d="M3 8L8 3L13 8L8 13L3 8Z" stroke-width="2" stroke-linejoin="round" stroke="black" mask="url(#stroke0_840_545)"/>
+<path d="M3 8L8 3L13 8L8 13L3 8Z" stroke-width="1" stroke-linejoin="round" stroke="black" mask="url(#stroke0_840_545)"/>
 </svg>

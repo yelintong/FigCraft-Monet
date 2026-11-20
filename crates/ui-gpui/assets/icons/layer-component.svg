@@ -6,5 +6,5 @@
 <path d="M11.5 9.5L13 8L11.5 6.5L10 8L11.5 9.5Z"/>
 <path d="M9.5 4.5L8 3L6.5 4.5L8 6L9.5 4.5Z"/>
 </mask>
-<path d="M6 8L4.5 9.5L3 8L4.5 6.5L6 8ZM8 13L6.5 11.5L8 10L9.5 11.5L8 13ZM13 8L11.5 9.5L10 8L11.5 6.5L13 8ZM8 3L9.5 4.5L8 6L6.5 4.5L8 3Z" stroke-width="2" stroke-linejoin="round" stroke="black" mask="url(#stroke0_840_543)"/>
+<path d="M6 8L4.5 9.5L3 8L4.5 6.5L6 8ZM8 13L6.5 11.5L8 10L9.5 11.5L8 13ZM13 8L11.5 9.5L10 8L11.5 6.5L13 8ZM8 3L9.5 4.5L8 6L6.5 4.5L8 3Z" stroke-width="1" stroke-linejoin="round" stroke="black" mask="url(#stroke0_840_543)"/>
 </svg>

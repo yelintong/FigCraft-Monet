@@ -561,8 +561,18 @@ pub fn export_preview(doc: &Document, id: NodeId, side_px: f32, revision: u64) -
 /// 一个资产的 40pt 缩略图：与 egui `assets_panel::thumbnail_pixmap` 逐行一致，
 /// 光栅化交给 `figcraft_render`（引擎/渲染层），这里只做色彩管理 + RGBA→BGRA 的字节换序。
 fn asset_thumb(doc: &Document, id: NodeId, side_px: f32) -> Option<(u32, u32, Vec<u8>)> {
-    let slice = doc.node(id).filter(|n| matches!(n.kind, NodeKind::Slice));
-    let b = if slice.is_some() { doc.world_bounds(id)? } else { figcraft_render::export_bounds(doc, id)? };
+    let node = doc.node(id)?;
+    let slice = matches!(node.kind, NodeKind::Slice).then_some(node);
+    // Page 节点自己没有几何：预览和 `file.export` 一样，按页面子层合成。
+    let page_children = matches!(node.kind, NodeKind::Page { .. }).then(|| node.children.clone());
+    let setting = node.exports.first().cloned().unwrap_or_default();
+    let b = if let Some(children) = &page_children {
+        figcraft_engine::cmd::file::export_area(doc, children, &setting)?
+    } else if slice.is_some() {
+        doc.world_bounds(id)?
+    } else {
+        figcraft_render::export_bounds(doc, id)?
+    };
     let side = b.width().max(b.height());
     if !(side.is_finite() && side > 0.0) {
         return None;
@@ -574,8 +584,10 @@ fn asset_thumb(doc: &Document, id: NodeId, side_px: f32) -> Option<(u32, u32, Ve
     // 借 `doc` 到一条临时的大栈线程上渲染（`spawn_scoped` 不需要 clone 文档）；有 thread_local
     // 缓存兜着，只在内容变化时才会走到这里。
     let pix = crate::render_stack::on_render_stack(|| {
-        if let Some(n) = slice {
-            let setting = n.exports.first().cloned().unwrap_or_default();
+        if let Some(children) = &page_children {
+            let layers = figcraft_engine::cmd::file::drawn_layers(doc, children, &setting);
+            figcraft_render::render_area(doc, &layers, b, scale)
+        } else if slice.is_some() {
             let layers = figcraft_engine::cmd::file::drawn_layers(doc, &[id], &setting);
             figcraft_render::render_area(doc, &layers, b, scale)
         } else {
@@ -1330,6 +1342,9 @@ pub struct PanelData {
     pub doc_profile: String,
     /// Export 节 Preview 的缩略图（BGRA）：只在 Preview 展开时由 `lib.rs::panel_data` 填。
     pub export_preview: Option<(u32, u32, Vec<u8>)>,
+    /// 预览图可用的最大宽度（面板宽 - 左右 16 - 呼吸位），由 `lib.rs` 按当前栏宽填入。
+    /// 0 哨兵会让 `max_w` 算成负值、图片根本不渲染（2026-11-20 实测修复）。
+    pub export_preview_max_w: f32,
     pub selection_colors: Vec<SelectionColorRow>,
     /// 选中的顶层图层里**有没有带子级的**（frame / group / component / instance）。
     /// 上游 `selection_colors.rs::section`：两组不同颜色才显示；只有一组时，若选中的层有子级
@@ -1341,6 +1356,8 @@ pub struct PanelData {
     pub variable_modes: Vec<ModeRow>,
     pub section: Option<SectionData>,
     pub page: Option<PageData>,
+    /// 空选区时页面节点本身：Page 页的导出节用它当 `export.*` 的目标与预览源。
+    pub page_node: Option<NodeId>,
     /// Auto layout 的 W/H + sizing + 约束比例 + min/max。
     pub dimensions: Option<DimensionsData>,
     /// 排版快照（仅全部选中都是文本节点时 `Some`）；驱动 Typography 节。
@@ -1528,6 +1545,32 @@ fn paint_rows(doc: &Document, ids: &[NodeId], fills: bool) -> Option<Vec<PaintRo
     )
 }
 
+/// 导出设置列表 → 面板行快照。Design 区与 Page 页共用同一份映射。
+fn export_rows(list: &[figcraft_doc::ExportSetting]) -> Vec<ExportRow> {
+    list.iter()
+        .enumerate()
+        .map(|(index, e)| ExportRow {
+            index,
+            size: e.size.label(),
+            suffix: e.suffix.clone(),
+            format: e.format.ext(),
+            format_label: e.format.label(),
+            is_raster: e.format.is_raster(),
+            contents_only: e.contents_only,
+            include_bounding_box: e.include_bounding_box,
+            svg_outline_text: e.svg_outline_text,
+            svg_id_attribute: e.svg_id_attribute,
+            svg_simplify_stroke: e.svg_simplify_stroke,
+            vd_compat: e.vd_compat.key(),
+            bleed: e.print.bleed,
+            crop_marks: e.print.crop_marks,
+            bleed_marks: e.print.bleed_marks,
+            cmyk: e.print.cmyk,
+            color_profile: e.color_profile.key(),
+        })
+        .collect()
+}
+
 /// 读取当前选区的完整快照。
 pub fn read(doc: &Document, ids: &[NodeId], page: Option<NodeId>, ready_filter: usize) -> PanelData {
     let mut d = PanelData::default();
@@ -1648,6 +1691,13 @@ pub fn read(doc: &Document, ids: &[NodeId], page: Option<NodeId>, ready_filter: 
             local_styles: doc.styles.len(),
             export_ids: page_node.map(|n| n.children.clone()).unwrap_or_default(),
         });
+        // 页面导出节与 Design 区用同一个通用导出控件：目标就是页面节点自己，设置存在它身上；
+        // 页面还没有设置时给一条默认的（PNG 1x），面板一进来就能改格式 / 预览。
+        d.page_node = page;
+        if let Some(n) = page_node {
+            let list = if n.exports.is_empty() { vec![figcraft_doc::ExportSetting::default()] } else { n.exports.clone() };
+            d.exports = Some(export_rows(&list));
+        }
         return d;
     }
 
@@ -1755,30 +1805,7 @@ pub fn read(doc: &Document, ids: &[NodeId], page: Option<NodeId>, ready_filter: 
     });
 
     // ── Export（`export_panel.rs::section`） ──
-    d.exports = common(doc, ids, |n| n.exports.clone()).map(|list| {
-        list.iter()
-            .enumerate()
-            .map(|(index, e)| ExportRow {
-                index,
-                size: e.size.label(),
-                suffix: e.suffix.clone(),
-                format: e.format.ext(),
-                format_label: e.format.label(),
-                is_raster: e.format.is_raster(),
-                contents_only: e.contents_only,
-                include_bounding_box: e.include_bounding_box,
-                svg_outline_text: e.svg_outline_text,
-                svg_id_attribute: e.svg_id_attribute,
-                svg_simplify_stroke: e.svg_simplify_stroke,
-                vd_compat: e.vd_compat.key(),
-                bleed: e.print.bleed,
-                crop_marks: e.print.crop_marks,
-                bleed_marks: e.print.bleed_marks,
-                cmyk: e.print.cmyk,
-                color_profile: e.color_profile.key(),
-            })
-            .collect()
-    });
+    d.exports = common(doc, ids, |n| n.exports.clone()).map(|list| export_rows(&list));
 
     // ── Selection colors（`selection_colors.rs::section`：两组不同颜色，或一组且选中的层有子级） ──
     d.selection_colors = selection_colors(doc, ids);

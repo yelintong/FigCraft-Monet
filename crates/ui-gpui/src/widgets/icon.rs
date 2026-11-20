@@ -36,6 +36,8 @@ pub enum Icon {
     Panel,
     Menu,
     Settings,
+    /// 四圆点：Fill / Stroke / 样式 / 网格行的「打开样式编辑器」按钮（24 网格）。
+    StyleSettings,
     Trash,
     /// Filled rectangle (the `Rectangle` node kind).
     Rectangle,
@@ -198,6 +200,8 @@ impl Icon {
         Icon::Panel,
         Icon::Menu,
         Icon::Settings,
+        /// 四圆点：Fill / Stroke / 样式 / 网格行的「打开样式编辑器」按钮（24 网格）。
+        Icon::StyleSettings,
         Icon::Trash,
         Icon::Rectangle,
         Icon::Ellipse,
@@ -297,6 +301,7 @@ impl Icon {
             Icon::Panel => "ui-panel",
             Icon::Menu => "ui-menu",
             Icon::Settings => "ui-settings",
+            Icon::StyleSettings => "ui-style-settings",
             Icon::Trash => "ui-trash",
             Icon::Rectangle => "shape-rectangle",
             Icon::Ellipse => "shape-ellipse",
@@ -394,6 +399,7 @@ impl Icon {
             Icon::Panel => "ui-panel",
             Icon::Menu => "ui-menu",
             Icon::Settings => "ui-settings",
+            Icon::StyleSettings => "ui-style-settings",
             Icon::Trash => "ui-trash",
             Icon::Rectangle => "shape-rectangle",
             Icon::Ellipse => "shape-ellipse",
@@ -564,6 +570,7 @@ static ICON_FILES: &[(&str, &[u8])] = &[
     ("ui-search", include_bytes!("../../assets/icons/ui-search.svg")),
     ("ui-section", include_bytes!("../../assets/icons/ui-section.svg")),
     ("ui-settings", include_bytes!("../../assets/icons/ui-dot.svg")),
+    ("ui-style-settings", include_bytes!("../../assets/icons/ui-style-settings.svg")),
     ("ui-sun", include_bytes!("../../assets/icons/ui-sun.svg")),
     ("ui-templates", include_bytes!("../../assets/icons/ui-templates.svg")),
     ("ui-trash", include_bytes!("../../assets/icons/ui-dot.svg")),
@@ -666,6 +673,13 @@ pub fn paint_tool(icon: Icon, color: impl Into<gpui::Rgba>) -> impl IntoElement 
     paint(icon, color, natural_size(icon))
 }
 
+/// 图标按钮 / 输入框插槽 / 分段控件统一用它取**原生 glyph 尺寸**：按各自 SVG 的 viewBox
+/// （16 或 24）画，不压成 16/12（2026-11-20 用户明令旧标准已废）。24 槽里画 24 网格
+/// 1:1，16 网格仍画 16，线宽由 `rescale_strokes` 保持不变。
+pub fn default_glyph(icon: Icon) -> f32 {
+    natural_size(icon)
+}
+
 /// Paint `icon` centred in `bounds`, scaled to the shorter side, through `Window::paint_svg`.
 pub(crate) fn draw_centred(window: &mut Window, bounds: Bounds<Pixels>, icon: Icon, color: gpui::Rgba, cx: &App) {
     let w: f32 = bounds.size.width.into();
@@ -720,7 +734,7 @@ mod tests {
 
     #[test]
     fn every_icon_has_an_external_svg_with_the_shared_stroke() {
-        assert_eq!(Icon::ALL.len(), 91, "Icon 变体数变了：请同步 ALL / asset_name / 本断言");
+        assert_eq!(Icon::ALL.len(), 92, "Icon 变体数变了：请同步 ALL / asset_name / 本断言");
         let mut names = HashSet::new();
         for &icon in Icon::ALL {
             let rel = icon.asset_rel();
@@ -757,6 +771,38 @@ mod tests {
             let bytes = file_bytes(icon.asset_rel()).unwrap();
             let parsed = usvg::Tree::from_data(bytes, &usvg::Options::default());
             assert!(parsed.is_ok(), "{:?}: {:?}", icon, parsed.err());
+        }
+    }
+
+    /// SVG 遮罩按亮度取 alpha：白 = 显示，黑 = 全透明。GPUI 只取 SVG 的 alpha、颜色由
+    /// `text_color` 注入，所以 mask 里的 `fill` **不是颜色而是可见性开关**，绝不能被归一化
+    /// 成 `#000`。2026-11-20 图标整理把 5 个 mask 的 `white` 改成 `#000`，图标整个消失。
+    ///
+    /// 合法写法只有两种：mask 自身 `fill="white"`，或 mask 内有一个 `fill="white"` 的白底
+    /// rect（Figma 的 inside-stroke 导出，黑 path 在白底上挖洞）。两种都没有 = 该 mask 全遮。
+    #[test]
+    fn every_icon_mask_has_an_opaque_white_region() {
+        for &icon in Icon::ALL {
+            let rel = icon.asset_rel();
+            let text = std::str::from_utf8(file_bytes(rel).unwrap()).unwrap();
+            let mut rest = text;
+            while let Some(at) = rest.find("<mask") {
+                let tag_end = rest[at..].find('>').map(|i| at + i).unwrap_or(rest.len());
+                let tag = &rest[at..tag_end];
+                // mask 内容到 </mask>；取不到就按到 svg 尾。
+                let close = rest[tag_end..].find("</mask>").map(|i| tag_end + i);
+                let inner = close.map(|i| &rest[tag_end..i]).unwrap_or("");
+                let mask_is_white = tag.contains("fill=\"white\"") || tag.contains("fill=\"#fff\"") || tag.contains("fill=\"#ffffff\"");
+                let has_white_rect = inner.contains("fill=\"white\"") || inner.contains("fill=\"#fff\"") || inner.contains("fill=\"#ffffff\"");
+                assert!(
+                    mask_is_white || has_white_rect,
+                    "{rel}: mask 既非 white 也无白底 rect → 全透明，被它遮住的描边看不见（PR#9 归一化 bug）"
+                );
+                match close {
+                    Some(i) => rest = &rest[i + "</mask>".len()..],
+                    None => break,
+                }
+            }
         }
     }
 

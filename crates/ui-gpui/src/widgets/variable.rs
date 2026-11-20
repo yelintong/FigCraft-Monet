@@ -21,14 +21,16 @@ use crate::widgets::input::template::{Frame, Input};
 use crate::widgets::{TEXT_PT, pt, rgba, tokens};
 use gpui::{Div, SharedString, Window, div, prelude::*};
 
-/// The "Apply variable" button: 18×18, centred 11 pt from the row's right edge, `Icon::Variable`
-/// inset 3 (`variable_ui.rs:379-391`). The caller places it.
+/// The "Apply variable" button: 24×24 槽（用户 2026-11-20：18/12 是旧标准，已废），
+/// `Icon::Variable` 按自身 viewBox 原生尺寸画（24 网格 24），线宽由 rescale_strokes 稳定。
+/// The caller places it.
 pub fn variable_button() -> Div {
     let t = tokens();
-    div().size(pt(18.0)).rounded(pt(4.0)).flex().items_center().justify_center().hover(|s| s.bg(rgba(t.hover))).child(paint_icon(
+    let glyph = crate::widgets::icon::default_glyph(Icon::Variable);
+    div().size(pt(24.0)).rounded(pt(4.0)).flex().items_center().justify_center().hover(|s| s.bg(rgba(t.hover))).child(paint_icon(
         Icon::Variable,
         rgba(t.text_secondary),
-        12.0,
+        glyph,
     ))
 }
 

@@ -756,6 +756,33 @@ fn wide_button(f: &RightFields, label: SharedString, cmd: &'static str, params: 
         })
 }
 
+/// 右栏所有「打开 detached 小窗」的 24pt 图标按钮的**唯一通用封装**（egui 侧的
+/// `icons::button` + `Popup::from_toggle_button_response`）。
+///
+/// 三件事必须成组，缺一件就复现「第一次对位正确、第二次鼠标移出按钮后整个窗口往下跑」：
+/// 1. **稳定 id**：按钮必须带 `trigger` 派生的 id。`IconButton` 不给 id 时用帧内序号
+///    （`next_stable_id`），开窗改变元素树后序号漂移 → GPUI 把按钮当新元素重挂 → 探针量到
+///    新位置；自动布局的 dots 一直带 `.id("layout-settings-dots")` 所以从不出问题。
+/// 2. **跨帧探针**：`with_window_trigger(trigger)` 把按钮真实顶部写进按 trigger 稳定的 cell。
+/// 3. **按下即对位**：`anchored_top(trigger)` 读同一个 cell 把卡片顶部对到按钮顶部。
+///
+/// 所有右栏开窗按钮都走这里 —— 与 eGUI 一样，定位能力全项目只有这一份。
+pub(crate) fn window_open_button(
+    trigger: &str,
+    icon: Icon,
+    active: bool,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    crate::popovers::with_window_trigger(
+        IconButton::new(icon)
+            .id(SharedString::from(format!("window-open-{trigger}")))
+            .size(24.0)
+            .active(active)
+            .on_click(move |_e, window, cx| on_click(window, cx)),
+        trigger,
+    )
+}
+
 /// 右栏 detached 窗口的**唯一**打开入口。
 ///
 /// 所有 24×24 按钮 / 色块 / 下拉都调它，行为因此只有一套：
@@ -850,23 +877,20 @@ fn variables_window_button(f: &RightFields, trigger: &'static str, icon: Icon, r
     let root = f.popups();
     let queue = f.queue();
     let active = root.is_open(trigger);
-    crate::popovers::with_window_trigger(
-        IconButton::new(icon).size(24.0).active(active).on_click(move |_e, window, cx: &mut App| {
-            let top = crate::popovers::anchored_top(trigger, window);
-            open_list_window_at(
-                root.clone(),
-                queue.clone(),
-                cx,
-                window.mouse_position(),
-                Some(top),
-                trigger.to_string(),
-                ListWindow::Variables,
-                SharedString::from(tr("Variables")),
-                rows.clone(),
-            );
-        }),
-        trigger,
-    )
+    window_open_button(trigger, icon, active, move |window, cx| {
+        let top = crate::popovers::anchored_top(trigger, window);
+        open_list_window_at(
+            root.clone(),
+            queue.clone(),
+            cx,
+            window.mouse_position(),
+            Some(top),
+            trigger.to_string(),
+            ListWindow::Variables,
+            SharedString::from(tr("Variables")),
+            rows.clone(),
+        );
+    })
 }
 
 /// 一行的 24 pt 图标按钮组（header 的 trailing 槽）。
@@ -912,24 +936,21 @@ fn style_menu(f: &RightFields, d: &PanelData, ty: &'static str, target: Option<&
         None => format!("styles-{ty}"),
     };
     let active = root.is_open(&trigger);
-    let probe_key = trigger.clone();
-    crate::popovers::with_window_trigger(
-        IconButton::new(icon).size(24.0).active(active).on_click(move |_e, window, cx: &mut App| {
-            let top = crate::popovers::anchored_top(&trigger, window);
-            open_list_window_at(
-                root.clone(),
-                queue.clone(),
-                cx,
-                window.mouse_position(),
-                Some(top),
-                trigger.clone(),
-                ListWindow::Styles(ty),
-                SharedString::from(title),
-                rows.clone(),
-            );
-        }),
-        &probe_key,
-    )
+    let btn_key = trigger.clone();
+    window_open_button(&btn_key, icon, active, move |window, cx| {
+        let top = crate::popovers::anchored_top(&trigger, window);
+        open_list_window_at(
+            root.clone(),
+            queue.clone(),
+            cx,
+            window.mouse_position(),
+            Some(top),
+            trigger.clone(),
+            ListWindow::Styles(ty),
+            SharedString::from(title),
+            rows.clone(),
+        );
+    })
 }
 
 /// egui `style_picker::chip`：已链接共享样式时，在节的**标题下面**多画一行
@@ -1340,15 +1361,12 @@ pub(crate) fn paints(
             let popups = f.popups();
             let stroke_queue = f.queue();
             let stroke_data = d.clone();
-            let dots = crate::popovers::with_window_trigger(
-                IconButton::new(Icon::Menu).size(24.0).active(popups.is_open("stroke")).on_click(move |_e, window, cx: &mut App| {
-                    let top = crate::popovers::anchored_top("stroke", window);
-                    open_detached_with(popups.clone(), "stroke", Some(top), cx, |anchor, cx| {
-                        crate::popovers::WindowState::stroke(stroke_queue.clone(), &stroke_data, cx, anchor)
-                    });
-                }),
-                "stroke",
-            );
+            let dots = window_open_button("stroke", Icon::Menu, popups.is_open("stroke"), move |window, cx| {
+                let top = crate::popovers::anchored_top("stroke", window);
+                open_detached_with(popups.clone(), "stroke", Some(top), cx, |anchor, cx| {
+                    crate::popovers::WindowState::stroke(stroke_queue.clone(), &stroke_data, cx, anchor)
+                });
+            });
             // 第二行 = 描边对齐下拉 + **线宽字段** + 独立边宽 + 高级描边（egui `paints.rs`:
             // `dropdown(align, half)` 之后紧跟 `number_field_mixed("strokeWeight", …, weight_w)`）。
             sec = sec.child(field_row(
@@ -1926,15 +1944,27 @@ pub(crate) fn grids(f: &RightFields, d: &PanelData, col: f32) -> Section {
 // Export —— `export_panel.rs::section` / `setting_row`
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn export(f: &RightFields, d: &PanelData, col: f32, n: &mut usize, cx: &mut App) -> Section {
+pub(crate) fn export(f: &RightFields, d: &PanelData, col: f32, _n: &mut usize, cx: &mut App) -> Section {
     // egui `export_panel.rs::section`: `mixed = shared.is_none() && sel.len() > 1`。
-    // mixed 时 `+` 是「整体替换成一条默认设置」（set_props exports），不是 export.add；
-    // tip 也从 "Add export setting" 变成 "Replace mixed export settings"。
+    // mixed 时 `+` 是「整体替换成一条默认设置」（set_props exports），不是 export.add。
+    // 空选区 = Page 页：设置存在页面节点上，导出按钮把页面子层合成一张图。
+    let page_mode = d.ids.is_empty() && d.page_node.is_some();
+    let target: Vec<figcraft_doc::NodeId> =
+        if page_mode { vec![d.page_node.expect("page mode has a page node")] } else { d.ids.clone() };
+    // `export.*` 的 `ids` 显式带上，空选区时才不会被当成「没有目标」。
+    let with_ids = |mut v: Value| {
+        if let Some(o) = v.as_object_mut() {
+            o.insert("ids".into(), json!(&target));
+        }
+        v
+    };
     let mixed = d.exports.is_none();
-    let replace = json!({ "props": { "exports": [figcraft_doc::ExportSetting::default()] } });
-    let plus =
-        if mixed { icon_cmd(Icon::Plus, "node.set", replace.clone(), f, false) } else { icon_cmd(Icon::Plus, "export.add", json!({}), f, false) };
-    // 空 / Mixed：只有置灰头部（同 Fill / Stroke）。mixed 时 `+` 已经是「整体替换成一条默认设置」。
+    let replace = with_ids(json!({ "props": { "exports": [figcraft_doc::ExportSetting::default()] } }));
+    let plus = if mixed {
+        icon_cmd(Icon::Plus, "node.set", replace, f, false)
+    } else {
+        icon_cmd(Icon::Plus, "export.add", with_ids(json!({})), f, false)
+    };
     let Some(rows) = d.exports.clone().filter(|v| !v.is_empty()) else {
         return Section::empty(tr("Export"), plus);
     };
@@ -1947,51 +1977,61 @@ pub(crate) fn export(f: &RightFields, d: &PanelData, col: f32, n: &mut usize, cx
         let formats: Vec<(String, &'static str, Value)> =
             [("PNG", "png"), ("JPG", "jpg"), ("SVG", "svg"), ("PDF", "pdf"), ("WebP", "webp"), ("XML", "xml")]
                 .into_iter()
-                .map(|(l, ext)| (l.to_string(), "export.update", json!({ "index": index, "format": ext })))
+                .map(|(l, ext)| (l.to_string(), "export.update", with_ids(json!({ "index": index, "format": ext }))))
                 .collect();
         let mut fields: Vec<gpui::AnyElement> = Vec::new();
         if row.is_raster {
-            // egui `setting_row`: SCALES 的 label + 512w/512h，`export.update {"size": label}`。
             let mut sizes: Vec<(String, &'static str, Value)> = Vec::new();
             for v in figcraft_doc::ExportSize::SCALES {
                 let label = figcraft_doc::ExportSize::Scale { value: v }.label();
-                sizes.push((label.clone(), "export.update", json!({ "index": index, "size": label })));
+                sizes.push((label.clone(), "export.update", with_ids(json!({ "index": index, "size": label }))));
             }
             for s in ["512w", "512h"] {
-                sizes.push((s.to_string(), "export.update", json!({ "index": index, "size": s })));
+                sizes.push((s.to_string(), "export.update", with_ids(json!({ "index": index, "size": s }))));
             }
             fields.push(pick_dropdown(f, row.size.clone(), col, sizes).into_any_element());
         }
         fields.push(pick_dropdown(f, row.format_label, col, formats).into_any_element());
-        // Dots（`export_panel.rs::advanced_options` + `print_options`）：勾选 / 单选项在下，
-        // 见 `export_options` 的排序注释。
-        let dots = checked_menu_icon(f, Icon::Menu, 240.0, export_options(row, &d.doc_profile), false);
-        let minus = icon_cmd(Icon::Minus, "export.remove", json!({ "index": index }), f, false);
+        // Dots 设置小窗（用户要求：单选器放弹窗，不放下拉）。
+        let trigger = format!("export-options-{index}");
+        let popups = f.popups();
+        let queue = f.queue();
+        let export_rows = export_setting_rows(row, &d.doc_profile);
+        let btn_key = trigger.clone();
+        let dots = window_open_button(&btn_key, Icon::Menu, popups.is_open(&trigger), move |window, cx| {
+            let top = crate::popovers::anchored_top(&trigger, window);
+            open_detached_with(popups.clone(), trigger.clone(), Some(top), cx, |anchor, _cx| {
+                crate::popovers::WindowState::export_options(queue.clone(), tr("Export settings"), anchor, export_rows.clone())
+            });
+        });
+        let minus = icon_cmd(Icon::Minus, "export.remove", with_ids(json!({ "index": index })), f, false).into_any_element();
         sec = sec.child(field_row(fields, vec![dots, minus]));
-
-        // ② 第二行（统一网格）：Suffix（跨两列）。egui `setting_row` 里它夹在 size 与 format 之间；
-        // 网格一行最多两个字段列，所以 suffix 单独占一整行，仍走同一套列与行高。
-        let suffix = f.row_field(
-            cx,
-            slot(n),
-            &row.suffix,
-            RowEditCtx {
-                cmd: "export.update",
-                params: json!({ "index": index }),
-                key: "suffix",
-                scale: 1.0,
-                string_value: true,
-                paint: None,
-                nest: None,
-                nest_key: None,
-                paint_color: None,
-            },
-        );
-        sec = sec.child(field_row_full(suffix));
     }
 
-    // ③ Preview（egui `export_panel::preview`）：折叠行 + 160 pt 预览框。预览图与 Inspect
-    // 缩略图同一条渲染管线（`panel_data` 只在展开时填充 `export_preview`）。
+    // ② 导出按钮（egui `wide_button`）：放在预览**上面**，紧贴设置行；左右 16pt，与预览框同宽。
+    //    suffix 输入框那一整行已删除（空值时不可见却占 32pt，把按钮和设置行撑开）。
+    let name = d.header.as_ref().map(|h| h.layer_name.clone()).unwrap_or_default();
+    let (cmd, params, label): (&'static str, Value, SharedString) = if page_mode {
+        let fmt = rows.first().map(|r| r.format).unwrap_or("png");
+        let page_ids = d.page.as_ref().map(|p| p.export_ids.clone()).unwrap_or_default();
+        ("file.export", json!({ "ids": page_ids, "format": fmt }), tr("Export page").into())
+    } else if target.len() == 1 && !name.is_empty() {
+        ("file.exportLayers", json!({ "ids": &target }), trf("Export {name}", &[("name", &name)]).into())
+    } else {
+        ("file.exportLayers", json!({ "ids": &target }), trn("Export {n} layers", target.len(), &[]).into())
+    };
+    sec = sec.child(block_row(
+        div()
+            .w_full()
+            .h(pt(crate::widgets::ROW_H))
+            .flex()
+            .items_center()
+            .pl(pt(crate::widgets::PAD))
+            .pr(pt(crate::widgets::PAD))
+            .child(wide_button(f, label, cmd, params).flex_1()),
+    ));
+
+    // ③ Preview（egui `export_panel::preview`）：折叠行 + 160 pt 预览框。
     let open = f.export_preview_open.get();
     let toggle = f.export_preview_open.clone();
     let wake = f.cmds.clone();
@@ -2011,32 +2051,35 @@ pub(crate) fn export(f: &RightFields, d: &PanelData, col: f32, n: &mut usize, cx
     sec = sec.child(field_row_full(head));
     if open {
         let t = tokens();
-        let mut frame =
-            div().w_full().h(px(160.0)).rounded(px(crate::widgets::RADIUS)).border_1().border_color(rgba(t.border)).overflow_hidden().relative();
+        // flex_1（不是 w_full）：父层带 16pt 内边距，w_full 会按整栏宽算、右边顶到面板边缘。
+        let mut frame = div()
+            .flex_1()
+            .h(px(160.0))
+            .rounded(px(crate::widgets::RADIUS))
+            .border_1()
+            .border_color(rgba(t.border))
+            .overflow_hidden()
+            .relative();
         frame = frame.child(
             canvas(|b, _w, _cx| b.size, |b, _, window, _cx| crate::widgets::checker(window, b, 8.0)).absolute().inset_0(),
         );
         if let Some((w, h, buf)) = &d.export_preview {
             let img = img(ImageSource::Render(crate::canvas::render_worker::wrap_bgra(*w, *h, buf.clone())))
-                .max_w(px(full_w - crate::widgets::PAD - crate::widgets::PAD_RIGHT - 16.0))
+                .max_w(px(d.export_preview_max_w.max(32.0)))
                 .max_h(px(144.0));
             frame = frame.child(div().absolute().inset_0().flex().items_center().justify_center().child(img));
         }
-        sec = sec
-            .child(block_row(div().w_full().pl(pt(crate::widgets::PAD)).pr(pt(crate::widgets::PAD_RIGHT)).pb(pt(8.0)).child(frame)));
+        // 左右都 16，和上面的按钮严格同宽。
+        sec = sec.child(block_row(
+            div()
+                .w_full()
+                .flex()
+                .pl(pt(crate::widgets::PAD))
+                .pr(pt(crate::widgets::PAD))
+                .pb(pt(8.0))
+                .child(frame),
+        ));
     }
-
-    // ④ 底部导出按钮（egui `wide_button` + `export_layers`）：推 `file.exportLayers`，路径选择
-    // 交给通用的下载投递（单文件保存框 / 多文件选文件夹，见 `lib.rs::deliver_download`）。
-    let ids = d.ids.clone();
-    // The export button uses the layer's own name, not its node type.
-    let name = d.header.as_ref().map(|h| h.layer_name.clone()).unwrap_or_default();
-    let label: SharedString = if ids.len() == 1 && !name.is_empty() {
-        trf("Export {name}", &[("name", &name)]).into()
-    } else {
-        trn("Export {n} layers", ids.len(), &[]).into()
-    };
-    sec = sec.child(field_row_full(wide_button(f, label, "file.exportLayers", json!({ "ids": ids }))));
     Section::Full(sec)
 }
 
@@ -2045,6 +2088,80 @@ pub(crate) fn export(f: &RightFields, d: &PanelData, col: f32, n: &mut usize, cx
 /// 顺序按用户 2026-11-19 的要求：**带勾选 / 单选状态的项全部排在下面**。尺寸已提到行内的
 /// 通用下拉，所以菜单里剩下的都是勾选项；两个单选组（Compatibility、Color profile）用
 /// 分隔线开头，Color profile 放在最末。
+/// 导出高级选项弹窗的正文行（egui `advanced_options` 的 1:1 移植）。
+///
+/// 勾选项用通用 Toggle，VD_COMPAT / Color profile 两组用 Radio（egui `widgets::radio`）；
+/// 每组前一条 SubLabel 就是 egui 的 `widgets::label(..., text_secondary)`。egui 里这些住在
+/// `menu_popup` 下拉中，但单选器在下拉里不好放，用户要求改用通用弹窗，内容一行不差。
+fn export_setting_rows(row: &ExportRow, doc_profile: &str) -> Vec<crate::popovers::Setting> {
+    use crate::popovers::{Opt, Setting};
+    let index = row.index;
+    let mut out: Vec<Setting> = Vec::new();
+    let toggle = |label: String, on: bool, key: &'static str| Setting::Toggle {
+        tab: 0,
+        label: label.into(),
+        on: std::rc::Rc::new(std::cell::RefCell::new(on)),
+        supported: true,
+        on_cmd: Opt::new(String::new(), "export.update", json!({ "index": index, key: true })),
+        off_cmd: Opt::new(String::new(), "export.update", json!({ "index": index, key: false })),
+    };
+    out.push(toggle(tr("Ignore overlapping layers").to_string(), row.contents_only, "contentsOnly"));
+    if row.format == "svg" || row.include_bounding_box {
+        out.push(toggle(tr("Include bounding box").to_string(), row.include_bounding_box, "includeBoundingBox"));
+    }
+    if row.format == "svg" {
+        out.push(toggle(tr("Outline text").to_string(), row.svg_outline_text, "svgOutlineText"));
+        out.push(toggle(tr("Include id attribute").to_string(), row.svg_id_attribute, "svgIdAttribute"));
+        out.push(toggle(tr("Simplify stroke").to_string(), row.svg_simplify_stroke, "svgSimplifyStroke"));
+    }
+    if row.format == "xml" {
+        out.push(toggle(tr("Include id attribute").to_string(), row.svg_id_attribute, "svgIdAttribute"));
+        out.push(Setting::SubLabel { tab: 0, text: tr("Compatibility").into() });
+        for (label, key) in [
+            (tr("Best effort").to_string(), "bestEffort"),
+            (tr("Exact only").to_string(), "exact"),
+            (tr("Ignore unsupported").to_string(), "ignore"),
+        ] {
+            out.push(Setting::Radio {
+                tab: 0,
+                label: label.into(),
+                on: row.vd_compat == key,
+                cmd: Opt::new(String::new(), "export.update", json!({ "index": index, "vdCompat": key })),
+            });
+        }
+    }
+    if row.format == "pdf" {
+        out.push(Setting::Toggle {
+            tab: 0,
+            label: "3 mm bleed".into(),
+            on: std::rc::Rc::new(std::cell::RefCell::new(row.bleed > 0.0)),
+            supported: true,
+            on_cmd: Opt::new(String::new(), "export.update", json!({ "index": index, "bleed": "3mm" })),
+            off_cmd: Opt::new(String::new(), "export.update", json!({ "index": index, "bleed": 0 })),
+        });
+        out.push(toggle(tr("Crop marks").to_string(), row.crop_marks, "cropMarks"));
+        out.push(toggle(tr("Bleed marks").to_string(), row.bleed_marks, "bleedMarks"));
+        out.push(toggle("CMYK".to_string(), row.cmyk, "cmyk"));
+    }
+    if row.is_raster {
+        out.push(Setting::SubLabel { tab: 0, text: tr("Color profile").into() });
+        for p in figcraft_doc::ExportColorProfile::ALL {
+            let label = match p {
+                figcraft_doc::ExportColorProfile::SameAsFile => trf("Same as file ({profile})", &[("profile", &doc_profile)]),
+                figcraft_doc::ExportColorProfile::Srgb => "sRGB".to_string(),
+                figcraft_doc::ExportColorProfile::DisplayP3 => "Display P3".to_string(),
+            };
+            out.push(Setting::Radio {
+                tab: 0,
+                label: label.into(),
+                on: row.color_profile == p.key(),
+                cmd: Opt::new(String::new(), "export.update", json!({ "index": index, "colorProfile": p.key() })),
+            });
+        }
+    }
+    out
+}
+
 fn export_options(row: &ExportRow, doc_profile: &str) -> Vec<(String, Option<bool>, &'static str, Value, bool)> {
     let index = row.index;
     let toggle = |label: String, on: bool, key: &str| {
@@ -2126,15 +2243,12 @@ fn corner_smoothing_button(f: &RightFields, d: &PanelData) -> gpui::AnyElement {
     let queue = f.queue();
     let value = d.corner_smoothing.unwrap_or(0.0) as f32;
     let open = popups.is_open("corner-smoothing");
-    crate::popovers::with_window_trigger(
-        IconButton::new(Icon::Menu).size(24.0).active(open).on_click(move |_e, window, cx: &mut App| {
-            let top = crate::popovers::anchored_top("corner-smoothing", window);
-            open_detached_with(popups.clone(), "corner-smoothing", Some(top), cx, |anchor, _cx| {
-                crate::popovers::WindowState::corner_smoothing(queue.clone(), value, anchor)
-            });
-        }),
-        "corner-smoothing",
-    )
+    window_open_button("corner-smoothing", Icon::Menu, open, move |window, cx| {
+        let top = crate::popovers::anchored_top("corner-smoothing", window);
+        open_detached_with(popups.clone(), "corner-smoothing", Some(top), cx, |anchor, _cx| {
+            crate::popovers::WindowState::corner_smoothing(queue.clone(), value, anchor)
+        });
+    })
 }
 
 /// Appearance 的 header 图标（egui `paints.rs::appearance`：Eye/Variable/Blend）。
@@ -2157,11 +2271,23 @@ pub(crate) fn appearance(
     let blend_open_ref = f.blend_open.clone();
     let blend_is_open = *blend_open_ref.borrow();
     let blend_open_for_click = blend_open_ref.clone();
-    let blend = IconButton::new(Icon::Settings).size(24.0).active(blend_is_open).on_click(move |_e, _w, _cx| {
-        let open = !*blend_open_for_click.borrow();
-        *blend_open_for_click.borrow_mut() = open;
-        blend_cmds.wake();
-    });
+    // 水滴图标走取色器专用 `PickerIcon::Blend`（资源只在 picker_icons 表注册，
+    // 不再往 Icon/ICON_FILES 里重复加一份）。按钮外观与通用 24pt 图标按钮一致。
+    let blend = div()
+        .size(pt(24.0))
+        .rounded(pt(5.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(blend_is_open, |d| d.bg(rgba(tokens().selected_row)))
+        .when(!blend_is_open, |d| d.hover(|s| s.bg(rgba(tokens().hover))))
+        .child(crate::picker_icons::paint(crate::picker_icons::PickerIcon::Blend, rgba(tokens().icon), 24.0))
+        .on_mouse_down(gpui::MouseButton::Left, move |_e, _w, _cx| {
+            let open = !*blend_open_for_click.borrow();
+            *blend_open_for_click.borrow_mut() = open;
+            blend_cmds.wake();
+        });
     // egui `right.rs::appearance`：Opacity 与 Corner radius 同一行；圆角字段**后面**紧跟一颗
     // 24 pt「Individual corners」开关（`indep_ok` 才出现），展开后是两行四个独立圆角字段，
     // 第二行行尾才是「Corner smoothing」按钮（点开通用小窗）。
@@ -2345,15 +2471,12 @@ fn type_settings_button(f: &RightFields, d: &PanelData) -> gpui::AnyElement {
     let queue = f.queue();
     let text = d.text.clone().unwrap_or_default();
     let open = popups.is_open("type-settings");
-    crate::popovers::with_window_trigger(
-        IconButton::new(Icon::Menu).size(24.0).active(open).on_click(move |_e, window, cx: &mut App| {
-            let top = crate::popovers::anchored_top("type-settings", window);
-            open_detached_with(popups.clone(), "type-settings", Some(top), cx, |anchor, cx| {
-                crate::popovers::WindowState::type_settings(queue.clone(), &text, cx, anchor)
-            });
-        }),
-        "type-settings",
-    )
+    window_open_button("type-settings", Icon::Menu, open, move |window, cx| {
+        let top = crate::popovers::anchored_top("type-settings", window);
+        open_detached_with(popups.clone(), "type-settings", Some(top), cx, |anchor, cx| {
+            crate::popovers::WindowState::type_settings(queue.clone(), &text, cx, anchor)
+        });
+    })
 }
 
 /// 矢量编辑模式下选中点的面板（egui `vector_panel.rs::points`）。
@@ -4253,7 +4376,7 @@ fn local_style_row(
                         .flex()
                         .items_center()
                         .when(!selected, move |d| d.opacity(0.0).group_hover(group, |s| s.opacity(1.0)))
-                        .child(IconButton::new(Icon::Settings).size(24.0).on_click(move |_e, window, cx| {
+                        .child(IconButton::new(Icon::StyleSettings).size(24.0).on_click(move |_e, window, cx| {
                             cx.stop_propagation();
                             open(window, cx);
                         }))

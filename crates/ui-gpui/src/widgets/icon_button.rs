@@ -25,7 +25,7 @@
 //! assigned so hover/press state resolves correctly.
 
 use crate::widgets::icon::{Icon, paint as paint_icon};
-use crate::widgets::{ICON, RADIUS, SLOT, pt, rgba, tokens};
+use crate::widgets::{RADIUS, SLOT, pt, rgba, tokens};
 use gpui::{App, ClickEvent, Div, ElementId, IntoElement, Stateful, Window, div, prelude::*};
 
 /// The click callback; kept as an alias so the struct field stays readable.
@@ -122,7 +122,9 @@ impl IntoElement for IconButton {
 
     fn into_element(self) -> Self::Element {
         let t = tokens();
-        let glyph = self.glyph.unwrap_or(if self.size >= 22.0 { ICON } else { 12.0 });
+        // 旧标准把所有 glyph 压成 ICON(16) / 12；用户 2026-11-20 明令废除：图标按自身
+        // viewBox 原生尺寸画（24 网格画 24、16 网格画 16），线宽由 rescale_strokes 稳定。
+        let glyph = self.glyph.unwrap_or_else(|| crate::widgets::icon::default_glyph(self.icon));
         let glyph_color = rgba(if self.active { t.accent } else { t.icon });
         // 显式 `.id(...)` 优先（锚定弹窗用）；否则用本帧稳定序号。
         // 一定要 `.id()`：GPUI 0.2.1 里 `hover`/`active`/`on_click` 只挂在 `Stateful<Div>` 上，

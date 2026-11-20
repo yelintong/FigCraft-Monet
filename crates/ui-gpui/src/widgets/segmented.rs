@@ -136,25 +136,29 @@ impl Segmented {
                 .justify_center()
                 // 等宽格：`flex_1` 时按份数分，`hugging` 时每格一个 24 pt 方。
                 .min_w(px(0.0))
+                .relative()
                 .overflow_hidden();
             cell = if self.fill || self.fixed_w.is_some() { cell.flex_1() } else { cell.w(pt(self.height)) };
             // 激活格「抬起」：白底 + 1 pt 内侧描边（设计里两种状态的图标同色，靠这块白底示意）。
+            // 画在绝对层里：flow 边框会参与 flex 分宽，选中时把这一格撑宽、整条 bar 抖一下。
             if chosen {
-                cell = cell.bg(rgba(t.panel)).border_1().border_color(rgba(t.border));
+                cell = cell.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded(pt(CELL_RADIUS))
+                        .bg(rgba(t.panel))
+                        .border_1()
+                        .border_color(rgba(t.border)),
+                );
             }
             // 未选中格**没有 hover 变体**（用户 2026-11-12：通用多选择器悬停不要有样式）。
             // 设计里只有「选中抬起」一种状态，光标已经是 pointer，够了；不再加 hover 水洗。
             let content: AnyElement = match item {
                 SegItem::Icon(icon) => {
-                    // 24 网格的图稿放进 24 的槽就是 1:1，不缩放、不改内部图形；旧的 16 网格字形照旧 16。
-                    let glyph = if self.height <= 21.0 {
-                        12.0
-                    } else if crate::widgets::icon::is_24_grid(*icon) {
-                        24.0
-                    } else {
-                        crate::widgets::ICON
-                    };
-                    paint_icon(*icon, rgba(t.icon), glyph).into_any_element()
+                    // 用户 2026-11-20：16/12 是旧标准，已废。按 SVG 自身 viewBox 原生尺寸画
+                    // （24 网格 24、16 网格 16），线宽由 rescale_strokes 保持稳定。
+                    paint_icon(*icon, rgba(t.icon), crate::widgets::icon::default_glyph(*icon)).into_any_element()
                 }
                 SegItem::Svg(typ) => {
                     let glyph = if self.height <= 21.0 { 14.0 } else { 16.0 };

@@ -1633,10 +1633,13 @@ impl CanvasView {
         // 管线与 Inspect 资产缩略图共用（`cached_asset_thumb`，按 revision 缓存）。
         if self.fields.export_preview_open()
             && d.exports.as_ref().is_some_and(|e| !e.is_empty())
-            && let Some(id) = ds.selection.first().copied()
+            && let Some(id) = ds.selection.first().copied().or(Some(ds.page))
         {
             d.export_preview = panels::right::data::export_preview(&ds.doc, id, 320.0, ds.revision);
         }
+        // 预览图最大宽度：预览框左右各 16，图片再让 8 pt 呼吸位。
+        // 0 哨兵会让 sections.rs 里 max_w 算成负值、图片根本不渲染。
+        d.export_preview_max_w = (self.right_w - crate::widgets::PAD * 2.0 - 16.0).max(32.0);
 
         // Zoom / Show 菜单的勾选状态来自引擎的 ViewState，不从 UI 另存一份。
 

@@ -36,7 +36,7 @@ pub use text_input::{TextAlign, TextInput};
 use crate::canvas::geom::Color32;
 use crate::widgets::icon::{Icon, paint as paint_icon};
 use crate::widgets::input::text_input::centred_line_origin;
-use crate::widgets::{ICON, TEXT_PT, pt, rgba, tokens};
+use crate::widgets::{TEXT_PT, pt, rgba, tokens};
 use gpui::{AnyElement, Bounds, Edges, SharedString, TextRun, canvas, div, point, prelude::*, px, size};
 use std::rc::Rc;
 
@@ -130,7 +130,8 @@ pub fn slot_child(slot: &Slot) -> Option<AnyElement> {
                 .into_any_element(),
             )
         }
-        Slot::Icon(i) => Some(paint_icon(*i, rgba(t.icon), ICON).into_any_element()),
+        // 旧标准把所有图标压成 ICON(16)；用户 2026-11-20 明令按 viewBox 原生尺寸画。
+        Slot::Icon(i) => Some(paint_icon(*i, rgba(t.icon), crate::widgets::icon::default_glyph(*i)).into_any_element()),
         Slot::Dot(c) => Some(div().size(pt(14.0)).rounded(pt(3.0)).bg(rgba(*c)).border_1().border_color(rgba(t.border)).into_any_element()),
         Slot::Custom(f) => Some(f()),
     }

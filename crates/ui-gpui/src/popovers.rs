@@ -18,7 +18,7 @@ use crate::widgets::menu::menu_popup_in;
 use crate::widgets::popover::{self, HEADER_H, Open, Surface, WIDTH, popover_body, popover_window, title_text};
 use crate::widgets::typ_icons::TypIcon;
 use crate::widgets::{
-    Icon, IconButton, SegItem, Segmented, Slider, Slot, TextEdit, TextField, number_field, number_field_ranged, pt, rgba, search_field, tokens,
+    Icon, IconButton, SegItem, Segmented, Slider, Slot, TextEdit, TextField, number_field, number_field_ranged, pt, rgba, search_field, text_field, tokens,
 };
 use crate::widgets::{MenuRow, dropdown};
 use figcraft_i18n::tr;
@@ -91,6 +91,10 @@ pub(crate) enum WindowKind {
     TypeSettings,
     /// 效果设置小窗：点右栏效果行的方框弹出，装该效果的设置项与类型切换。
     EffectSettings,
+    /// 导出设置小窗：点右栏导出行的 Dots 弹出，装 egui `export_panel::advanced_options`
+    /// 的勾选项与两组单选（VD_COMPAT / Color profile）。egui 里是下拉，但单选器在下拉里
+    /// 不好放，所以按用户要求用通用弹窗承载（内容 1:1 照抄 egui）。
+    ExportSettings,
     /// 本地样式编辑器（egui `style_picker::editor`）：与上面几个设置窗共用
     /// `WindowState` 通用弹窗卡 + `Setting` 通用行，只是分派标识不同，不是另一套弹窗实现。
     StyleEditor,
@@ -385,6 +389,19 @@ pub(crate) enum Setting {
         supported: bool,
         on_cmd: Opt,
         off_cmd: Opt,
+    },
+    /// 一条单选行（egui `widgets::radio`）：导出高级选项里的 VD_COMPAT / Color profile。
+    /// `on` 是当前是否选中；点击未选中项才推 `cmd`，选中项保持不动（与 egui 同义）。
+    Radio {
+        tab: u8,
+        label: SharedString,
+        on: bool,
+        cmd: Opt,
+    },
+    /// 一条只读小标题（egui `widgets::label(..., text_secondary)`）：单选组前的分组名。
+    SubLabel {
+        tab: u8,
+        text: SharedString,
     },
     /// 由行尾 `>` 展开的一组子行（`decoration_details`：样式 / 粗细 / 跳过下伸部）。
     /// `flag` 与 `Setting::IconOptions.drill_in` 共用；false 时整组不渲染，点 `>` 翻转后显示。
@@ -840,6 +857,34 @@ fn cap_options(key: &'static str) -> Vec<Opt> {
         .collect()
 }
 
+/// 描边 Dashes 字段的文本 → 虚线数组（egui `stroke.rs::parse_dashes`）：逗号分隔的
+/// 非负数；空段忽略，出现非数字 / 负数 / 非有限值即整条无效。
+fn parse_dashes(text: &str) -> Option<Vec<f64>> {
+    let values = text
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0))
+        .collect::<Option<Vec<f64>>>()?;
+    (!values.is_empty()).then_some(values)
+}
+
+#[cfg(test)]
+mod dash_tests {
+    use super::parse_dashes;
+
+    #[test]
+    fn custom_dashes_parse_like_egui() {
+        assert_eq!(parse_dashes("10, 20, 10"), Some(vec![10.0, 20.0, 10.0]));
+        assert_eq!(parse_dashes("4"), Some(vec![4.0]));
+        // 空段忽略、浮点/负数/非数字即整条无效（egui `parse_dashes`）。
+        assert_eq!(parse_dashes(" 4 , , 8 "), Some(vec![4.0, 8.0]));
+        assert_eq!(parse_dashes("4, -1"), None);
+        assert_eq!(parse_dashes("4, abc"), None);
+        assert_eq!(parse_dashes("   "), None);
+    }
+}
+
 /// 宽度剖面当前显示名：真实 preset、Custom（手改过）、Uniform（无）或 Mixed（多选不一致）。
 fn profile_label(data: &PanelData) -> String {
     match &data.stroke_profile {
@@ -1125,12 +1170,22 @@ impl WindowState {
         });
         // 行为驱动，不是静态列表：虚线字段仅在虚线时出现，miter 角仅 miter 连接，端帽仅开放路径。
         // 这些枚举设置是**下拉**而非左右分格（PR #823）：分格行宽只有 134pt，多出选项就被挤掉。
-        let dashed = data.dashes.as_ref().is_some_and(|d| !d.is_empty());
+        //
+        // Stroke style 是 Solid / Dash / Custom 三选（egui `stroke.rs::dash_settings`）：
+        // - 空/None = Solid；一段或两段 = Dash（Dash + Gap 两个数字框）；
+        // - 三段以上 = Custom（一条 Dashes 文本框，填逗号分隔的 dash,gap,dash,…）。
+        // 窗口是点击时的快照（只有 StyleEditor 会随命令刷新），所以 Custom 的输入框在构造期
+        // 就按 `data.dashes` 决定可见性，与 Dash/Gap 二选一 —— 和 egui 的行为一致。
+        let pattern = data.dashes.as_deref().filter(|d| !d.is_empty());
+        let custom = pattern.is_some_and(|d| d.len() > 2);
         let style_current = match &data.dashes {
             None => tr("Mixed").to_string(),
             Some(d) if d.is_empty() => tr("Solid").to_string(),
+            Some(d) if d.len() > 2 => tr("Custom").to_string(),
             Some(_) => tr("Dash").to_string(),
         };
+        // 从 Dash 切到 Custom 时先给一条三段样例，窗口重开后正好落到 Custom 分支显示文本框。
+        let custom_seed = [weight * 4.0, weight * 2.0, weight * 4.0];
         let join_current = data.join.map_or_else(|| tr("Mixed").to_string(), |j| join_label(j).to_string());
         let mut settings = vec![stroke_dropdown(
             0,
@@ -1139,9 +1194,24 @@ impl WindowState {
             vec![
                 Opt::new(tr("Solid"), "node.set", json!({ "props": { "dashes": [] } })),
                 Opt::new(tr("Dash"), "node.set", json!({ "props": { "dashes": [weight * 4.0, weight * 4.0] } })),
+                Opt::new(tr("Custom"), "node.set", json!({ "props": { "dashes": custom_seed } })),
             ],
         )];
-        if dashed {
+        if custom {
+            // Custom：一条 Dashes 文本框，值为当前数组用逗号拼出；提交时按 parse_dashes 解析回数组。
+            // 用通用 `text_field` + `Setting::Field`，不自造输入控件。
+            let text = pattern.map(|d| d.iter().map(|v| crate::widgets::input::fmt_num(*v)).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            let dashes_field = text_field(cx, 176.0, &text, "", Slot::None, Slot::None);
+            let queue = cmds.clone();
+            dashes_field.update(cx, move |tf, _| {
+                tf.set_on_commit(move |typed, _, _| {
+                    if let Some(list) = parse_dashes(typed) {
+                        queue.push(Cmd { id: "node.set", params: Some(json!({ "props": { "dashes": list } })) });
+                    }
+                });
+            });
+            settings.push(Setting::Field { tab: 0, label: tr("Dashes").into(), field: dashes_field });
+        } else if pattern.is_some() {
             settings.push(Setting::Number { tab: 0, label: tr("Dash").into(), field: dash_field });
             settings.push(Setting::Number { tab: 0, label: tr("Gap").into(), field: gap_field });
         }
@@ -1639,6 +1709,18 @@ impl WindowState {
         // 否则「先改 X 再改 Y」时 Y 的 effect.set 会带着开窗时的旧 X 把 X 冲掉。
         let shared = Rc::new(RefCell::new(effect.clone()));
         settings.extend(effect_setting_rows(cx, &cmds, index, &shared, &ty));
+        w.settings = Rc::new(RefCell::new(settings));
+        w
+    }
+
+    /// 导出高级选项弹窗（egui `export_panel::advanced_options`）：正文是一组通用 `Setting`
+    /// 行 —— 勾选项用 Toggle，VD_COMPAT / Color profile 两组用 Radio。egui 原本是下拉菜单，
+    /// 但单选器在下拉里不好放，用户要求改用通用弹窗承载；行的编号与文案 1:1 照抄 egui。
+    pub(crate) fn export_options(cmds: Cmds, title: impl Into<SharedString>, anchor: Point<Pixels>, settings: Vec<Setting>) -> Self {
+        let mut w = Self::base(WindowKind::ExportSettings, title, cmds, Open::Anchor(anchor));
+        w.width = 240.0;
+        w.pad = 12.0;
+        w.height = HEADER_H + (settings.len() as f32) * 28.0 + 24.0;
         w.settings = Rc::new(RefCell::new(settings));
         w
     }
@@ -2812,6 +2894,7 @@ impl WindowState {
             | WindowKind::EffectSettings
             | WindowKind::StyleEditor
             | WindowKind::CornerSmoothing
+            | WindowKind::ExportSettings
             | WindowKind::FontPicker => title_text(self.title.clone()).into_any_element(),
             // Type settings 的标题栏就是三页签（截图顶部没有单独的 "Type settings" 标题文字），
             // 与 lizard `type_settings_panel` 把 Tabs 放进 header 一致。
@@ -2892,9 +2975,12 @@ impl WindowState {
             WindowKind::Color => self.color_body(cx),
             WindowKind::CornerSmoothing => self.corner_smoothing_body(),
             WindowKind::FontPicker => self.list_element(cx, body_h),
-            WindowKind::Layout | WindowKind::Stroke | WindowKind::TypeSettings | WindowKind::EffectSettings | WindowKind::StyleEditor => {
-                self.settings_element(cx)
-            }
+            WindowKind::Layout
+            | WindowKind::Stroke
+            | WindowKind::TypeSettings
+            | WindowKind::EffectSettings
+            | WindowKind::ExportSettings
+            | WindowKind::StyleEditor => self.settings_element(cx),
             WindowKind::Variables | WindowKind::TextStyles => self.list_element(cx, body_h),
             WindowKind::VariablesTable => {
                 if self.editor.is_none() {
@@ -4835,6 +4921,45 @@ impl WindowState {
                 let row = type_row(label, &t, seg.into_any_element());
                 Some(if *supported { row } else { div().w_full().opacity(0.45).child(row).into_any_element() })
             }
+            Setting::SubLabel { tab: st, text } => {
+                if *st != tab {
+                    return None;
+                }
+                Some(div().w_full().pt(pt(4.0)).text_size(pt(10.0)).text_color(rgba(t.text_secondary)).child(text.clone()).into_any_element())
+            }
+            Setting::Radio { tab: st, label, on, cmd } => {
+                if *st != tab {
+                    return None;
+                }
+                // egui `widgets::radio`：一个小圆环 + 中间实心点 + 文案；点未选中项才推命令。
+                let ring = div()
+                    .w(pt(12.0))
+                    .h(pt(12.0))
+                    .rounded_full()
+                    .border(pt(1.0))
+                    .border_color(rgba(t.text_secondary))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(*on, |d| d.child(div().w(pt(6.0)).h(pt(6.0)).rounded_full().bg(rgba(t.accent))));
+                let radio_id: SharedString = format!("export-radio-{}", label).into();
+                let row = div().id(radio_id).w_full().h(pt(24.0)).flex().flex_row().items_center().gap(pt(6.0)).child(ring).child(
+                    div().text_size(pt(11.0)).text_color(rgba(if *on { t.text } else { t.text_secondary })).child(label.clone()),
+                );
+                if *on {
+                    Some(row.into_any_element())
+                } else {
+                    let cmds = self.cmds.clone();
+                    let opt = cmd.clone();
+                    Some(
+                        row.cursor_pointer()
+                            .on_click(move |_e, _w, _cx| {
+                                cmds.push(Cmd { id: opt.cmd, params: Some(opt.now()) });
+                            })
+                            .into_any_element(),
+                    )
+                }
+            }
             Setting::ExpandedRows { tab: st, flag, rows } => {
                 if *st != tab || !*flag.borrow() {
                     return None;
@@ -5656,8 +5781,15 @@ impl WindowState {
         // 实际约 150），拿它去 `open_pos` 判断「底部溢出」会误判 → 窗口被抬到按钮上方；
         // 若这一帧就 pin 住，错误位置就永久固化。固定高的窗口（字体窗）`height` 本身就是
         // 真值，不受此约束。量到真高后 `height` 已是真实值，此时钉住才正确。
-        let height_measured = self.fixed_height() || self.measured_h.get() > 0.0;
-        let pinned = self.placed_once && at.is_none() && !viewport_changed && height_measured;
+        // 钉住原点：一旦定位过一次，后续帧（含量到真实高度的那一帧、hover 消失触发的
+        // notify 重绘）都复用同一原点，不再回到 `open_pos` 重算。
+        //
+        // ⛔ 原先要求 `height_measured` 才钉，于是「首帧 Open::At 顶部对齐按钮」→「次帧量到
+        // 真高改走 Open::Anchor + 触底抬升」位置不一致，窗口跳一下。变量窗/字体窗高度大又靠
+        // 下、抬升明显，且绑定按钮 hover 消失正好在那帧 notify，于是「鼠标移开就往下跑」。
+        // 首帧的 Open::At 顶部严格对齐按钮、右缘贴面板左缘，正是 egui「top on y, right edge
+        // on x」的正确位置（用户确认点开时是好的）；把它钉住即可，触底可通过拖拽处理。
+        let pinned = self.placed_once && at.is_none() && !viewport_changed;
         let prev_origin = self.origin;
         // 首帧还没量到真实高度：不要用估算高度走 `open_pos` 的溢出抬升（会把卡片冤枉地
         // 顶到按钮上方）。直接把卡片右上角放在锚点上 —— 顶部严格对齐按钮、右缘贴面板，
@@ -5708,8 +5840,8 @@ impl WindowState {
         }
         let (origin, card) = pop.show(viewport, dismiss);
         self.origin = origin;
-        // 只有拿真实高度定位过，才算「定位完成」可以钉住；首帧用估算高度的位置不能钉。
-        self.placed_once = height_measured;
+        // 首帧的 Open::At 位置已正确（顶部对齐按钮），这一帧就算定位完成可以钉住。
+        self.placed_once = true;
         // 菜单卡片与浮层卡片同挂窗口根（els），所以菜单用窗口坐标，不被浮层的滚动裁剪。
         // 只要有菜单打开，就在最底层垫一层覆盖整窗的透明 backdrop：点击菜单以外的任何位置
         // 都会关闭菜单（弹窗窗口里没有主窗口那套 root popup backdrop，之前只能靠菜单逐项
@@ -6249,6 +6381,14 @@ mod tests {
     #[test]
     fn picker_menus_align_close_and_width_invariants() {
         let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/popovers.rs"));
+        // 源码切片必须落在字符边界上：按字节固定 +500 会在中文注释中间截断并 panic。
+        fn window(src: &str, start: usize, len: usize) -> &str {
+            let mut end = (start + len).min(src.len());
+            while end > start && !src.is_char_boundary(end) {
+                end -= 1;
+            }
+            &src[start..end]
+        }
         // AA 菜单块：从注释到 push_overlay 结束。
         let aa = src.find("// AA 设置下拉：若本帧锚点为 Some").expect("aa menu block");
         let aa_end = src[aa..].find("// ── 组装").map(|d| aa + d).expect("aa menu end");
@@ -6258,12 +6398,12 @@ mod tests {
         assert!(!aa_block.contains("Some(180.0)"), "AA menu must not hardcode 180 width (auto-size instead)");
         // 混色菜单：左对齐 = 直接用默认 menu_popup_in（BottomStart）。
         let blend = src.find("// 混色（水滴）菜单").expect("blend comment");
-        let blend_block = &src[blend..blend + 500];
+        let blend_block = window(src, blend, 500);
         assert!(blend_block.contains("menu_popup_in("), "blend menu must use default BottomStart (left-aligned)");
         assert!(!blend_block.contains("BottomEnd"), "blend menu must NOT be right-aligned");
         // 渐变类型菜单宽度 104，不硬编码 120。
         let grad = src.find("// 与上面的通用 dropdown 按钮（96）").expect("grad comment");
-        let grad_block = &src[grad..grad + 500];
+        let grad_block = window(src, grad, 500);
         assert!(grad_block.contains("Some(104.0)"), "gradient-kind menu width should be 104");
         assert!(!grad_block.contains("Some(120.0)"), "gradient-kind menu must not hardcode 120");
         // backdrop 必须排在 card 之后。
