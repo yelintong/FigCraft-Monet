@@ -173,7 +173,11 @@ pub fn handle(app: &mut CanvasApp, method: &str, p: &Value) -> Result<Value, Str
         "engine.execute" => {
             let cmd = p.get("command").and_then(Value::as_str).ok_or("`command` required")?;
             let params = p.get("params").cloned().unwrap_or(json!({}));
-            app.session.execute(cmd, &params).map_err(|e| e.to_string())
+            // 控制通道注入的操作可以改引擎副本，但不读写用户的系统剪贴板。
+            app.control_synthetic = true;
+            let result = app.session.execute(cmd, &params).map_err(|e| e.to_string());
+            app.control_synthetic = false;
+            result
             // 原文随后还会：清掉评论草稿、作废合成副本、丢掉 `dialog.*` 的 UI 请求、
             // `handle_ui_requests()`、`observe_presentation()`。这些都属于 egui 的面板/多窗口
             // 簿记（§13.2 未搬），GPUI 侧没有对应物。
@@ -247,7 +251,11 @@ pub fn handle(app: &mut CanvasApp, method: &str, p: &Value) -> Result<Value, Str
                     } else {
                         ("transform.nudge", json!({"dx": dx, "dy": dy, "big": m.shift}))
                     };
-                    app.session.execute(cmd, &params).map_err(|e| e.to_string())
+                    // 控制通道注入的操作可以改引擎副本，但不读写用户的系统剪贴板。
+                    app.control_synthetic = true;
+                    let result = app.session.execute(cmd, &params).map_err(|e| e.to_string());
+                    app.control_synthetic = false;
+                    result
                 }
                 _ => Err(format!("no shortcut `{key}`")),
             }

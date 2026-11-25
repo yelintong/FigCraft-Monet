@@ -41,10 +41,14 @@ pub(crate) fn target(app: &mut CanvasApp, p: Point) -> Vec<NodeId> {
     app.session.selection()
 }
 
-/// Whether a row can run: the engine owns the command. (The original also counts the commands its
-/// own UI implements — the clipboard and file dialogs — which this front-end does not have yet.)
+/// Whether a row can run: an engine command, or a clipboard command the UI implements itself
+/// (`crate::clipboard::invoke`), as in the original's `available(id)`.
 fn can_run(id: &str) -> bool {
-    !id.is_empty() && figcraft_engine::find_command(id).is_some()
+    if id.is_empty() {
+        return false;
+    }
+    figcraft_engine::find_command(id).is_some()
+        || matches!(id, "edit.copyAsCss" | "edit.copyAsSvg" | "edit.copyAsPng" | "edit.copyAsText" | "edit.copyLink")
 }
 
 fn shortcut_of(id: &str) -> Option<String> {
@@ -226,14 +230,14 @@ mod tests {
         assert!(list.contains(&COPY_AS));
         let copy_as_row = rows.iter().find(|r| r.id == COPY_AS).expect("copy as");
         assert_eq!(copy_as_row.sub.len(), 4);
-        assert!(copy_as_row.sub.iter().all(|r| r.disabled), "the clipboard formats are UI-side");
+        assert!(copy_as_row.sub.iter().all(|r| !r.disabled), "the clipboard formats are implemented by the UI");
         assert_eq!(rows.iter().filter(|r| r.separator_before).count(), 7, "eight groups, seven dividers between them");
     }
 
-    /// A row is greyed when the engine doesn't own its command.
+    /// A row is greyed when neither the engine nor the UI implements its command.
     #[test]
     fn an_unknown_command_is_greyed() {
-        assert!(!can_run("edit.copyAsCss"));
+        assert!(can_run("edit.copyAsCss"));
         assert!(can_run("edit.copy"));
         assert!(can_run("view.rulers"));
     }

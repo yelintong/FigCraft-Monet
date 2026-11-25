@@ -28,6 +28,8 @@
 
 mod app;
 
+mod clipboard;
+
 mod canvas;
 
 /// 标签条的纯几何 / 动画状态（上游 `ui-egui/src/tabs.rs` 的可测部分，P0-1）。
@@ -273,7 +275,8 @@ pub(crate) fn run_binding(app: &mut CanvasApp, id: &str) -> bool {
         // 钢笔还没闭合时 Delete 是「删掉上一个锚点」（原文同一分支）。
         "edit.delete" if app.session.tool.pen.is_some() => app.session.pen_finish().is_ok(),
 
-        _ => app.session.execute(id, &serde_json::json!({})).is_ok(),
+        // copy/cut/paste/Copy as 需要系统剪贴板桥接，其余仍是引擎命令。
+        _ => crate::clipboard::invoke(app, id, &serde_json::json!({})),
     }
 }
 
@@ -2515,11 +2518,11 @@ impl CanvasView {
             return;
         }
 
-        if let Err(e) = self.app.session.execute(id, &params) {
+        if !crate::clipboard::invoke(&mut self.app, id, &params) {
             // 不做无声吞掉：`FC_DEBUG_CMDS=1` 时把 id / 参数 / 错误打出来（同右栏那条通道）。
 
             if std::env::var_os("FC_DEBUG_CMDS").is_some() {
-                eprintln!("[ui cmd] {id} {params} -> {e}");
+                eprintln!("[ui cmd] {id} {params} -> failed");
             }
         }
 
