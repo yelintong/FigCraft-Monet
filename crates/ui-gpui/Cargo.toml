@@ -37,6 +37,11 @@ figcraft-color = { path = "../color" }
 # 字符串目录（与 ui-egui 共用一张编译期表）。
 figcraft-i18n = { path = "../i18n" }
 figcraft-geom = { path = "../geom" }
+# 系统剪贴板（与 apps/figcraft 同源）：图层/图片的跨窗口复制粘贴走这里。
+arboard = { version = "3.6", default-features = false, features = ["image-data", "wayland-data-control"] }
+# 剪贴板图片的 base64 载荷与 SVG 文本识别（对应上游 menus/clipboard.rs）。
+base64 = "0.22"
+figcraft-format = { path = "../format" }
 # 文字排版代数（字体到位后重排，与原文的 JobKey.fonts 一致）。
 figcraft-text = { path = "../text" }
 figcraft-collab-net = { path = "../collab-net" }

@@ -50,6 +50,11 @@ pub struct CanvasApp {
     pub motion_overlay: crate::canvas::motion_overlay::State,
     /// Motion gizmo 的跨帧拖动句柄（`State` 每帧重建，放不下）。
     pub motion_gizmo: crate::canvas::motion_overlay::Interaction,
+    /// 系统剪贴板桥接（跨窗口复制粘贴），以及我们上次写进去的内容。
+    pub clipboard: crate::clipboard::Clipboard,
+    pub clipboard_state: crate::clipboard::State,
+    /// 控制通道注入的操作：可以改引擎副本，但不许读写用户的系统剪贴板。
+    pub control_synthetic: bool,
 }
 
 impl CanvasApp {
@@ -72,6 +77,9 @@ impl CanvasApp {
             dev_cat_filter: None,
             motion_overlay: crate::canvas::motion_overlay::State::default(),
             motion_gizmo: crate::canvas::motion_overlay::Interaction::default(),
+            clipboard: crate::clipboard::Clipboard::new(),
+            clipboard_state: crate::clipboard::State::default(),
+            control_synthetic: false,
         };
         // 预选一个自动布局容器：启动即可见 hatch（紧贴轮廓 + padding 蓝斜线 + spacing 粉斜线），
         // 不用先手动点选，方便核对"选中=1px / 悬停=2px"与边距斜线管线。
