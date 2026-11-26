@@ -60,6 +60,19 @@ impl TextOnScreen {
             }
         }
     }
+
+    /// 页面坐标 `p` 落在第几个字符前（和引擎 `text_index_at` 同一条命中规则）。
+    pub(crate) fn index_at(&self, p: Point) -> usize {
+        let local = self.world.inverse() * p;
+        self.layout.hit(local.x, local.y - self.dy)
+    }
+
+    /// 第 `index` 个字符前的光标屏幕矩形：IME 候选窗按这个矩形定位。
+    pub(crate) fn caret_bounds(&self, app: &CanvasApp, index: usize, zoom: f64) -> gpui::Bounds<gpui::Pixels> {
+        let [a, b] = self.caret(app, index, zoom);
+        let (x0, y0, x1, y1) = (a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y));
+        gpui::Bounds { origin: gpui::point(gpui::px(x0), gpui::px(y0)), size: gpui::size(gpui::px((x1 - x0).max(1.0)), gpui::px((y1 - y0).max(1.0))) }
+    }
 }
 
 /// 节点在屏幕空间的定向轮廓（四角，跟随旋转/镜像）。

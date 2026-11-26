@@ -3,7 +3,7 @@
 //! 拖放目标 → 选中轮廓与变换框（含连接线端点、旋转原点）→ 框选 → 钢笔/橡皮筋/套索/橡皮 →
 //! 吸附参考线与尺寸。
 
-use figcraft_doc::{NodeId, NodeKind};
+use figcraft_doc::{Document, NodeId, NodeKind};
 use figcraft_engine::tools::{ToolId, selection_box, selection_frame};
 use figcraft_geom::Point;
 
@@ -398,20 +398,41 @@ pub(super) fn overlays(app: &CanvasApp, painter: &mut Painter, t: &Tokens) -> Ve
         }
     }
 
-    // ── 文字编辑：光标与选中。
+    // ── 文字编辑：光标、选中，以及输入法组合（preedit）的下划线与组合光标。
+    // 组合中的文字还没进文档，用引擎给的「组合文档」排版，光标/选区才不会错位。
+    let preedit = figcraft_engine::textedit::preedit_doc(&app.session);
+    let edoc: &Document = preedit.as_ref().map(|(d, _, _)| d).unwrap_or(&doc);
     if let Some(te) = ds.text_edit.clone()
-        && let Some(text) = super::outline::TextOnScreen::of(&doc, te.id)
+        && let Some(text) = crate::canvas::outline::TextOnScreen::of(edoc, te.id)
     {
-        if let Some(q) = node_quad(app, &doc, te.id) {
+        if let Some(q) = node_quad(app, edoc, te.id) {
             quad(painter, q, stroke(accent, 1.0));
         }
         let (a, b) = (te.caret.min(te.anchor), te.caret.max(te.anchor));
-        if a != b {
+        if a != b && preedit.is_none() {
             for q in text.selection(app, a, b) {
                 painter.add(Shape::convex_polygon(q.to_vec(), accent.gamma_multiply(0.3), Stroke::NONE));
             }
         }
-        painter.line_segment(text.caret(app, te.caret, zoom), stroke(t.text, 1.0));
+        if let Some((_, (mark_start, mark_end), _)) = preedit.as_ref() {
+            for r in text.layout.selection_rects(*mark_start, *mark_end) {
+                // 下划线画在基线下方三分之一行高处，只覆盖组合中的字符。
+                let Some(line) = text.layout.lines.iter().find(|l| (l.top - r.y0).abs() < 1e-6) else { continue };
+                let x1 = text
+                    .layout
+                    .glyphs
+                    .get(line.glyph_start..line.glyph_end)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|g| g.char_end > g.char_start && g.char_start >= *mark_start && g.char_end <= *mark_end)
+                    .map(|g| g.x + g.advance)
+                    .fold(r.x0, f64::max);
+                let y = line.baseline + (line.top + line.height - line.baseline) * 0.35;
+                painter.line_segment([text.at(app, r.x0, y), text.at(app, x1, y)], stroke(t.text, 1.0));
+            }
+        }
+        let caret = preedit.as_ref().map(|(_, _, cursor)| *cursor).unwrap_or(te.caret);
+        painter.line_segment(text.caret(app, caret, zoom), stroke(t.text, 1.0));
     }
 
     // ── 智能参考线与测量标注（标签避开尺寸标签）。
@@ -530,4 +551,34 @@ fn under_white(col: Color32) -> Color32 {
 /// 一条闭合四边形轮廓（供其它模块用）。
 pub(super) fn _quad(painter: &mut Painter, q: [Pos2; 4], st: Stroke) {
     quad(painter, q, st);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{CanvasApp, sample_doc};
+    use figcraft_engine::textedit;
+
+    /// 用户报的「文字编辑没有选中状态」：进入编辑并全选后，叠加层必须真的画出选区。
+    #[test]
+    fn editing_text_paints_its_selection_and_caret() {
+        let mut app = CanvasApp::new(sample_doc());
+        // 单元测试没有布局阶段，先给画布一个真实矩形，`to_screen` 才不是 inf。
+        app.canvas.rect = Rect { min: pos2(0.0, 0.0), max: pos2(800.0, 600.0) };
+        let v = app.session.execute("text.create", &serde_json::json!({"text": "Hello 世界", "x": 100.0, "y": 100.0})).expect("create text");
+        let id: NodeId = serde_json::from_value(v["id"].clone()).expect("text id");
+        textedit::begin(&mut app.session, id, None, false).expect("begin");
+        let ds = app.session.ds().expect("session");
+        let Some(text) = crate::canvas::outline::TextOnScreen::of(&ds.doc, id) else { return };
+        if text.layout.glyphs.is_empty() {
+            return; // 没装字体时没有字形（CI 设了 CRAFT_FONTS_DIR）。
+        }
+        let mut painter = Painter::new(Rect::NOTHING);
+        let _ = overlays(&app, &mut painter, &Tokens::dark());
+        let selection = painter.ops.iter().any(|o| matches!(o, super::super::painter::Op::Poly { fill, .. } if fill.a() > 0));
+        let caret =
+            painter.ops.iter().any(|o| matches!(o, super::super::painter::Op::Line { stroke, .. } if stroke.color.a() > 0 && stroke.width <= 1.0));
+        assert!(selection, "editing text must paint its selected range");
+        assert!(caret, "editing text must paint a caret");
+    }
 }
